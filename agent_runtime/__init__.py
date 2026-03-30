@@ -1,0 +1,17 @@
+"""最小化 Agent 运行时包。
+
+这个包会故意从一个很小的范围开始：
+
+- 一个 Agent 循环
+- 一个可替换的 LLM 客户端接口
+- 一个工具注册表
+- 一个示例 `bash` 工具
+
+第一版不追求功能完整，重点是把核心循环讲清楚，
+并给后续扩展留下清晰的结构边界。
+"""
+
+from .agent import AgentLoop
+from .types import ConversationMessage
+
+__all__ = ["AgentLoop", "ConversationMessage"]
