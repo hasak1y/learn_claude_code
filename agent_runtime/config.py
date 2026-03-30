@@ -73,12 +73,12 @@ def load_openai_compatible_config() -> OpenAICompatibleConfig:
 
     load_dotenv_if_present()
 
-    model = os.environ["LLM_MODEL"]
-    api_key = os.environ["LLM_API_KEY"]
-    base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+    model = os.environ["GPT-5.4"]
+    api_key = os.environ["sk-dtH7ymjhavgwrxLfqOPxn3Y5KKyQ0RYJ4rKn34Z1zUUkRpkR"]
+    base_url = os.getenv("LLM_BASE_URL", "https://mzlone.top/v1")
     timeout_seconds = int(os.getenv("LLM_TIMEOUT_SECONDS", "300"))
     max_tokens = int(os.getenv("LLM_MAX_TOKENS", "2000"))
-    temperature = float(os.getenv("LLM_TEMPERATURE", "0"))
+    temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 
     return OpenAICompatibleConfig(
         model=model,
