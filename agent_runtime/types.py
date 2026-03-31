@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 
 MessageRole = Literal["system", "user", "assistant", "tool"]
+AgentRunStatus = Literal["completed", "max_steps", "cancelled", "failed"]
 
 
 @dataclass(slots=True)
@@ -62,3 +63,23 @@ class LLMResponse:
     """
 
     message: ConversationMessage
+
+
+@dataclass(slots=True)
+class AgentRunResult:
+    """一次 Agent 回合运行后的结构化结果。
+
+    之所以不再只返回最后一条消息，是因为后续会引入：
+    - 子代理后台任务
+    - 取消
+    - 最大步数停止
+    - 失败后的统一上报
+
+    这些场景都需要一个比“最后一条消息”更稳定的结果结构。
+    """
+
+    status: AgentRunStatus
+    final_text: str
+    steps: int
+    last_message: ConversationMessage | None = None
+    error: str | None = None

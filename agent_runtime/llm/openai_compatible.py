@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
+import http.client
 import json
+import time
 from typing import Any
 from urllib import request
 from urllib.error import HTTPError, URLError
@@ -15,6 +17,14 @@ from urllib.error import HTTPError, URLError
 from ..config import OpenAICompatibleConfig
 from ..types import ConversationMessage, LLMResponse, ToolCall
 from .base import BaseLLMClient
+
+
+DEFAULT_HTTP_HEADERS = {
+    # 这里对齐 `api_test` 里已经验证可用的默认请求头。
+    # 某些中转服务会根据请求特征做拦截，默认 Python 请求头不一定能通过。
+    "User-Agent": "api-client/3.0",
+    "Accept": "application/json",
+}
 
 
 class OpenAICompatibleLLMClient(BaseLLMClient):
@@ -42,32 +52,108 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
         payload = {
             "model": self.config.model,
             "messages": self._build_api_messages(messages, system_prompt),
-            "tools": tools,
-            "tool_choice": "auto",
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
         }
 
-        url = f"{self.config.base_url.rstrip('/')}/chat/completions"
+        # 只有在确实存在工具定义时，才把工具相关字段发给服务端。
+        # 某些中转服务对 `"tools": []` 的兼容性很差，普通聊天反而会因此失败。
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        url = self._build_api_url("/v1/chat/completions")
         body = json.dumps(payload).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.config.api_key}",
         }
+        headers.update(DEFAULT_HTTP_HEADERS)
 
         http_request = request.Request(url=url, data=body, headers=headers, method="POST")
 
-        try:
-            with request.urlopen(http_request, timeout=self.config.timeout_seconds) as response:
-                raw_response = response.read().decode("utf-8")
-        except HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"LLM 请求失败，HTTP {exc.code}: {error_body}") from exc
-        except URLError as exc:
-            raise RuntimeError(f"LLM 请求失败: {exc}") from exc
+        raw_response = self._post_with_retries(http_request=http_request, url=url)
 
         data = json.loads(raw_response)
         return self._parse_api_response(data)
+
+    def _post_with_retries(self, http_request: request.Request, url: str) -> str:
+        """发送请求，并对短暂的网络断连做有限重试。"""
+
+        last_error: Exception | None = None
+        max_attempts = 3
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with request.urlopen(http_request, timeout=self.config.timeout_seconds) as response:
+                    return response.read().decode("utf-8")
+            except HTTPError as exc:
+                error_body = exc.read().decode("utf-8", errors="replace")
+                error_message = (
+                    f"LLM 请求失败，HTTP {exc.code}，请求地址：{url}，响应内容：{error_body}"
+                )
+
+                # 403 往往不是程序结构问题，而是接口地址、权限策略、
+                # 账号权限或代理服务本身拒绝了这次请求。
+                if exc.code == 403:
+                    error_message += (
+                        "。这通常表示当前接口拒绝访问。"
+                        "请优先检查 LLM_BASE_URL 是否正确、API Key 是否可用，"
+                        "以及当前服务是否允许你的来源 IP 或账号访问。"
+                    )
+
+                raise RuntimeError(error_message) from exc
+            except (
+                URLError,
+                TimeoutError,
+                ConnectionResetError,
+                http.client.RemoteDisconnected,
+            ) as exc:
+                last_error = exc
+                if attempt < max_attempts:
+                    time.sleep(0.8 * attempt)
+                    continue
+
+                raise RuntimeError(
+                    "LLM 请求失败，连接在服务端响应前被中断。"
+                    f"请求地址：{url}；原始错误：{exc}"
+                ) from exc
+            except OSError as exc:
+                last_error = exc
+                if attempt < max_attempts:
+                    time.sleep(0.8 * attempt)
+                    continue
+
+                raise RuntimeError(
+                    f"LLM 请求失败，请检查网络或代理连接。请求地址：{url}；原始错误：{exc}"
+                ) from exc
+
+        raise RuntimeError(f"LLM 请求失败：{last_error}")
+
+    def _build_api_url(self, path: str) -> str:
+        """根据 base_url 拼出最终接口地址。
+
+        这里兼容两种常见写法：
+        - `LLM_BASE_URL=https://api.openai.com/v1`
+        - `LLM_BASE_URL=https://some-proxy.example.com`
+
+        如果 base_url 已经以 `/v1` 结尾，就直接拼接去掉前缀后的路径。
+        如果没有，就自动补上 `/v1`，和 `api_test` 项目的行为保持一致。
+        """
+
+        base_url = self.config.base_url.rstrip("/")
+        normalized_path = path.strip()
+
+        if not normalized_path.startswith("/"):
+            normalized_path = f"/{normalized_path}"
+
+        if base_url.endswith("/v1") and normalized_path.startswith("/v1/"):
+            return f"{base_url}{normalized_path[3:]}"
+
+        if base_url.endswith("/v1"):
+            return f"{base_url}{normalized_path}"
+
+        return f"{base_url}{normalized_path}"
 
     def _build_api_messages(
         self,
@@ -126,7 +212,9 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
         content = self._normalize_message_content(message.get("content"))
         tool_calls: list[ToolCall] = []
 
-        for raw_tool_call in message.get("tool_calls", []):
+        raw_tool_calls = message.get("tool_calls") or []
+
+        for raw_tool_call in raw_tool_calls:
             function_block = raw_tool_call.get("function", {})
             raw_arguments = function_block.get("arguments", "{}")
 

@@ -5,13 +5,9 @@
 - 一个 Agent 循环
 - 一个可替换的 LLM 客户端接口
 - 一个工具注册表
-- 一个示例 `bash` 工具
+- 一个示例 `shell` 工具
+- 一个简单的 todo 状态管理器
 
 第一版不追求功能完整，重点是把核心循环讲清楚，
 并给后续扩展留下清晰的结构边界。
 """
-
-from .agent import AgentLoop
-from .types import ConversationMessage
-
-__all__ = ["AgentLoop", "ConversationMessage"]

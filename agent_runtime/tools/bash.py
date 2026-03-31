@@ -1,4 +1,4 @@
-"""一个最小版的 `bash` 风格 shell 工具。
+"""一个最小版的通用 shell 工具。
 
 第一版会故意保持简单：
 - 只执行一条命令
@@ -21,10 +21,10 @@ import subprocess
 from .base import BaseTool
 
 
-class BashTool(BaseTool):
+class ShellTool(BaseTool):
     """在当前项目目录里执行一条 shell 命令。"""
 
-    name = "bash"
+    name = "shell"
     description = "在当前工作目录执行一条 shell 命令。"
     input_schema = {
         "type": "object",
