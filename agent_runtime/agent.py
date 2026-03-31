@@ -8,6 +8,7 @@ from typing import Callable
 from .compaction import ConversationCompactor
 from .llm.base import BaseLLMClient
 from .session_log import SessionLogger
+from .task_graph import TaskGraphManager
 from .todo import TodoManager
 from .tools.base import ToolRegistry
 from .types import AgentRunResult, ConversationMessage
@@ -15,13 +16,7 @@ from .types import AgentRunResult, ConversationMessage
 
 @dataclass(slots=True)
 class AgentLoop:
-    """一个最小但可复用的 Agent 运行时。
-
-    当前版本在原有工具循环上补了三层压缩能力：
-    - 每轮请求前的 micro_compact
-    - 超阈值时的 auto_compact
-    - 模型显式触发的 manual compact
-    """
+    """一个最小但可复用的 Agent 运行时。"""
 
     llm_client: BaseLLMClient
     tool_registry: ToolRegistry
@@ -29,6 +24,7 @@ class AgentLoop:
     max_steps: int = 8
     echo_tool_calls: bool = True
     todo_manager: TodoManager | None = None
+    task_graph_manager: TaskGraphManager | None = None
     compactor: ConversationCompactor | None = None
     session_logger: SessionLogger | None = None
     log_scope: str = "parent"
@@ -50,6 +46,12 @@ class AgentLoop:
                     append_message=True,
                 )
 
+            task_graph_summary = (
+                self.task_graph_manager.render_summary()
+                if self.task_graph_manager is not None
+                else None
+            )
+
             if self.compactor is not None and self.compactor.should_auto_compact(
                 messages=messages,
                 system_prompt=self.system_prompt,
@@ -62,6 +64,7 @@ class AgentLoop:
                     reason="auto",
                     session_logger=self.session_logger,
                     log_scope=self.log_scope,
+                    task_graph_summary=task_graph_summary,
                 )
                 if self.echo_tool_calls:
                     print(f"[auto_compact] {compact_result}")
@@ -71,7 +74,9 @@ class AgentLoop:
                 request_messages.append(
                     ConversationMessage(
                         role="user",
-                        content=self.todo_manager.build_reminder(),
+                        content=self.todo_manager.build_reminder(
+                            task_graph_summary=task_graph_summary
+                        ),
                     )
                 )
 
@@ -87,7 +92,7 @@ class AgentLoop:
 
             if not response.message.tool_calls:
                 if self.todo_manager is not None:
-                    self.todo_manager.note_round(touched_todo=False)
+                    self.todo_manager.note_round(touched_tracking=False)
                 return AgentRunResult(
                     status="completed",
                     final_text=response.message.content or "（无最终文本）",
@@ -95,7 +100,7 @@ class AgentLoop:
                     last_message=response.message,
                 )
 
-            touched_todo = False
+            touched_tracking = False
             for tool_call in response.message.tool_calls:
                 if should_cancel is not None and should_cancel():
                     return self._build_terminal_result(
@@ -110,6 +115,11 @@ class AgentLoop:
                     print(f"\033[33m[{step_index}] $ {tool_call.name} {tool_call.arguments}\033[0m")
 
                 if tool_call.name == "compact" and self.compactor is not None:
+                    current_task_graph_summary = (
+                        self.task_graph_manager.render_summary()
+                        if self.task_graph_manager is not None
+                        else None
+                    )
                     tool_output = self.compactor.compact_history(
                         messages=messages,
                         llm_client=self.llm_client,
@@ -118,6 +128,7 @@ class AgentLoop:
                         reason="manual",
                         session_logger=self.session_logger,
                         log_scope=self.log_scope,
+                        task_graph_summary=current_task_graph_summary,
                     )
                 else:
                     tool_output = self.tool_registry.execute(
@@ -125,8 +136,8 @@ class AgentLoop:
                         arguments=tool_call.arguments,
                     )
 
-                if tool_call.name == "todo":
-                    touched_todo = True
+                if tool_call.name in {"todo", "task_create", "task_update"}:
+                    touched_tracking = True
 
                 if self.echo_tool_calls:
                     preview = tool_output[:200]
@@ -145,7 +156,7 @@ class AgentLoop:
                 )
 
             if self.todo_manager is not None:
-                self.todo_manager.note_round(touched_todo=touched_todo)
+                self.todo_manager.note_round(touched_tracking=touched_tracking)
 
         limit_message = ConversationMessage(
             role="assistant",

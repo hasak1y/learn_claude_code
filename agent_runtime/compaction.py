@@ -110,6 +110,7 @@ class ConversationCompactor:
         reason: str,
         session_logger: SessionLogger | None = None,
         log_scope: str = "parent",
+        task_graph_summary: str | None = None,
     ) -> str:
         """执行一次真正的历史压缩，并原地替换活跃消息列表。"""
 
@@ -123,6 +124,7 @@ class ConversationCompactor:
             llm_client=llm_client,
             todo_manager=todo_manager,
             transcript_path=transcript_path,
+            task_graph_summary=task_graph_summary,
         )
 
         recent_messages = original_messages[-self.preserve_recent_messages :]
@@ -153,6 +155,7 @@ class ConversationCompactor:
         llm_client: BaseLLMClient,
         todo_manager: TodoManager | None,
         transcript_path: Path,
+        task_graph_summary: str | None = None,
     ) -> str:
         """让模型生成结构化续航摘要。"""
 
@@ -169,12 +172,14 @@ class ConversationCompactor:
             "## 已完成事项\n"
             "## 未完成事项\n"
             "## 当前 Todo 状态\n"
+            "## 当前任务图状态\n"
             "## 已加载 Skills\n"
             "## 关键文件与修改\n"
             "## 关键工具结果\n"
             "## 重要约束与风险\n"
             "## 最近一次用户要求\n\n"
             f"当前 todo 状态：\n{todo_text}\n\n"
+            f"当前任务图状态：\n{task_graph_summary or '（当前没有任务图任务）'}\n\n"
             f"当前已加载 skills：{', '.join(loaded_skills) if loaded_skills else '（无）'}\n\n"
             f"完整 transcript 已保存到：{transcript_path}\n"
             "下面是待压缩的消息记录（可能已截断，请优先抓住关键信息）：\n\n"

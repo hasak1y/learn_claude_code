@@ -14,6 +14,7 @@ from agent_runtime.llm import OpenAICompatibleLLMClient
 from agent_runtime.session_log import SessionLogger
 from agent_runtime.skills import SkillRegistry
 from agent_runtime.subagents import SubagentRunner
+from agent_runtime.task_graph import TaskGraphManager
 from agent_runtime.todo import TodoManager
 from agent_runtime.tools.base import ToolRegistry
 from agent_runtime.tools.bash import ShellTool
@@ -22,6 +23,15 @@ from agent_runtime.tools.edit_file import EditFileTool
 from agent_runtime.tools.read_file import ReadFileTool
 from agent_runtime.tools.skill import LoadSkillTool
 from agent_runtime.tools.subagent import TaskTool
+from agent_runtime.tools.task_graph import (
+    CreateTaskTool,
+    GetTaskTool,
+    ListAllTasksTool,
+    ListBlockedTasksTool,
+    ListCompletedTasksTool,
+    ListReadyTasksTool,
+    UpdateTaskTool,
+)
 from agent_runtime.tools.todo import TodoTool
 from agent_runtime.tools.write_file import WriteFileTool
 from agent_runtime.types import ConversationMessage
@@ -37,8 +47,9 @@ def build_system_prompt(skill_registry: SkillRegistry) -> str:
         "读取文件时优先使用 read_file。"
         "创建或整体覆盖文本文件时优先使用 write_file。"
         "修改已有文件时优先使用 edit_file。"
-        "复杂或多步骤任务时应主动维护 todo 列表。"
-        "todo 列表中同一时刻最多只能有一个 in_progress。"
+        "简单、线性的短任务可使用 todo。"
+        "存在依赖、解锁关系或可并行推进的复杂任务，应优先使用 task graph 工具。"
+        "todo 中同一时刻最多只能有一个 in_progress。"
         "当某个子任务相对独立、适合单独完成并返回总结时，可以使用 task。"
         "task 会同步调用一个 fresh context 的子代理，父 Agent 会等待子代理返回最终文本。"
         "当上下文很长、阶段切换或工具结果累积较多时，可以使用 compact。"
@@ -56,7 +67,7 @@ def build_subagent_system_prompt(skill_registry: SkillRegistry) -> str:
     return (
         f"你是一个在 {os.getcwd()} 中运行的子代理。"
         "你拥有 fresh context，只负责当前被委派的单个子任务。"
-        "你没有 task 工具，不能继续创建新的子代理。"
+        "你没有 task 工具，也没有 task graph 工具，不能继续创建新的子代理或改动父任务图。"
         "需要时使用工具，任务完成后返回简洁的最终结论。"
         "读取文件时优先使用 read_file。"
         "创建或整体覆盖文本文件时优先使用 write_file。"
@@ -88,12 +99,20 @@ def build_parent_tool_registry(
     todo_manager: TodoManager,
     subagent_runner: SubagentRunner,
     skill_registry: SkillRegistry,
+    task_graph_manager: TaskGraphManager,
 ) -> ToolRegistry:
     """构造父 Agent 使用的工具集合。"""
 
     return ToolRegistry(
         [
             TodoTool(todo_manager=todo_manager),
+            CreateTaskTool(manager=task_graph_manager),
+            UpdateTaskTool(manager=task_graph_manager),
+            GetTaskTool(manager=task_graph_manager),
+            ListAllTasksTool(manager=task_graph_manager),
+            ListReadyTasksTool(manager=task_graph_manager),
+            ListBlockedTasksTool(manager=task_graph_manager),
+            ListCompletedTasksTool(manager=task_graph_manager),
             TaskTool(runner=subagent_runner),
             CompactTool(),
             LoadSkillTool(skill_registry=skill_registry),
@@ -120,6 +139,7 @@ def main() -> None:
     llm_client = OpenAICompatibleLLMClient(config)
     skill_registry = SkillRegistry(root=os.path.join(os.getcwd(), "skills"))
     todo_manager = TodoManager(reminder_threshold=3)
+    task_graph_manager = TaskGraphManager(tasks_dir=Path(os.getcwd()) / ".tasks")
     session_id = f"session_{int(time.time() * 1000)}"
     session_logger = SessionLogger(
         session_id=session_id,
@@ -141,6 +161,7 @@ def main() -> None:
         todo_manager=todo_manager,
         subagent_runner=subagent_runner,
         skill_registry=skill_registry,
+        task_graph_manager=task_graph_manager,
     )
     agent = AgentLoop(
         llm_client=llm_client,
@@ -149,6 +170,7 @@ def main() -> None:
         max_steps=12,
         echo_tool_calls=True,
         todo_manager=todo_manager,
+        task_graph_manager=task_graph_manager,
         compactor=compactor,
         session_logger=session_logger,
         log_scope="parent",
@@ -163,7 +185,10 @@ def main() -> None:
             print()
             break
 
-        if user_input.lower() in {"", "q", "quit", "exit"}:
+        if not user_input:
+            continue
+
+        if user_input.lower() in {"q", "quit", "exit"}:
             break
 
         user_message = ConversationMessage(role="user", content=user_input)

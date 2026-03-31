@@ -17,6 +17,7 @@
 - 一个 OpenAI-compatible LLM 适配器
 - 一个 `shell` 工具
 - 一个 `todo` 工具
+- 一组 `task_*` 任务图工具
 - 一个 `compact` 工具
 - 一个 `load_skill` 工具
 - 一个 `read_file` 工具
@@ -27,6 +28,7 @@
 - 一个本地 `skills/` 目录
 - 一个本地 `.transcripts/` 历史转储目录
 - 一个本地 `.sessions/` 追加会话日志目录
+- 一个本地 `.tasks/` 持久化任务图目录
 
 当前有意不实现的部分：
 
@@ -47,6 +49,7 @@ agent_runtime/
   session_log.py
   skills.py
   subagents.py
+  task_graph.py
   todo.py
   types.py
   llm/
@@ -60,6 +63,7 @@ agent_runtime/
     read_file.py
     skill.py
     subagent.py
+    task_graph.py
     todo.py
     write_file.py
 skills/
@@ -99,6 +103,11 @@ LLM_BASE_URL=https://api.openai.com/v1
 python main.py
 ```
 
+命令行交互约定：
+
+- 直接回车：忽略本次输入，继续等待
+- 输入 `q`、`quit` 或 `exit`：退出会话
+
 ## 会话日志
 
 当前项目会在会话开始时创建一个新的：
@@ -117,6 +126,38 @@ python main.py
 
 - `.sessions/`：全程追加日志，记录平时每条进入历史的消息
 - `.transcripts/`：只在真正 compact 时保存压缩前的完整历史快照
+
+## 任务图
+
+当前项目已经支持持久化任务图，适合处理有依赖关系或可并行推进的复杂任务。
+
+存储方式：
+
+- 每个任务一个 JSON 文件
+- 文件位置在 `.tasks/task_<id>.json`
+- `blockedBy` 表示静态依赖边，不会因为前置任务完成而被删除
+
+状态与派生语义：
+
+- 持久化状态只存 `pending / in_progress / completed`
+- `ready` 和 `blocked` 是运行时派生状态
+- `pending` 且所有依赖都已完成时，派生状态为 `ready`
+- `pending` 且仍有未完成依赖时，派生状态为 `blocked`
+
+当前任务图工具包括：
+
+- `task_create`
+- `task_update`
+- `task_get`
+- `task_list_all`
+- `task_list_ready`
+- `task_list_blocked`
+- `task_list_completed`
+
+适用建议：
+
+- 简单、线性的短任务：继续用 `todo`
+- 有前置依赖、后续解锁或并行结构的复杂任务：优先用任务图
 
 ## 三层压缩
 
@@ -158,6 +199,7 @@ python main.py
 - 已完成事项
 - 未完成事项
 - 当前 Todo 状态
+- 当前任务图状态
 - 已加载 Skills
 - 关键文件与修改
 - 关键工具结果
@@ -314,24 +356,31 @@ python main.py
 
 ## 后续规划
 
-### Todo 提醒机制
+### Todo 与任务图提醒机制
 
-当前项目已经支持 `todo` 工具，用来维护复杂任务的清单状态。
+当前项目已经支持 `todo` 和任务图两种任务跟踪方式。
 
 设计约束如下：
 
 - `todo` 工具每次提交的是完整清单，而不是局部 patch
 - 同一时刻最多只能有一个 `in_progress`
 - Agent 会在内存中维护当前 todo 状态
-- 如果模型连续多轮没有更新 todo，运行时会临时注入 reminder，提醒模型检查并更新 todo
+- 复杂任务如果存在依赖关系，应优先使用任务图
+- 如果模型连续多轮没有更新任何任务跟踪信息，运行时会临时注入 reminder
 
 当前 reminder 机制是轻量的：
 
 - 只在调用模型前临时注入
 - 不会把 reminder 永久写入正式对话历史
-- reminder 文本里会附带当前 todo 状态摘要
+- reminder 文本里会附带当前 todo 状态和任务图摘要
 
-这样做的目标是让复杂任务更稳定，不容易在多轮工具调用中丢步骤。
+当前会被视为“已更新任务跟踪”的操作包括：
+
+- `todo`
+- `task_create`
+- `task_update`
+
+这样做的目标是让复杂任务更稳定，不容易在多轮工具调用中丢步骤，也能同时覆盖简单清单和依赖任务图两种工作流。
 
 ### 子代理接口
 
