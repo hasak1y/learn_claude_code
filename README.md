@@ -16,6 +16,7 @@
 - 一个可复用的 Agent 循环
 - 一个 OpenAI-compatible LLM 适配器
 - 一个 `shell` 工具
+- 一组后台任务工具
 - 一个 `todo` 工具
 - 一组 `task_*` 任务图工具
 - 一个 `compact` 工具
@@ -44,6 +45,7 @@
 main.py
 agent_runtime/
   agent.py
+  background_jobs.py
   compaction.py
   config.py
   session_log.py
@@ -58,6 +60,7 @@ agent_runtime/
   tools/
     base.py
     bash.py
+    background_job.py
     edit_file.py
     path_utils.py
     read_file.py
@@ -158,6 +161,39 @@ python main.py
 
 - 简单、线性的短任务：继续用 `todo`
 - 有前置依赖、后续解锁或并行结构的复杂任务：优先用任务图
+
+## 后台任务
+
+当前项目已经支持最小后台任务系统，适合运行长时间 shell 命令。
+
+适用场景：
+
+- `npm install`
+- `pytest`
+- `docker build`
+- 其他预计要跑较久、且结果不必立刻决定下一步的独立命令
+
+当前后台任务工具包括：
+
+- `shell_background`
+- `background_job_list`
+- `background_job_result`
+
+当前实现方式：
+
+- 主线程继续负责 AgentLoop 和 LLM 调用
+- 后台线程负责执行长时间 shell 子进程
+- 任务完成后把结果放入完成队列
+- 主线程在下一次调用 LLM 前统一把完成结果注入历史
+
+当前刻意不做：
+
+- 流式输出
+- 交互式 stdin
+- 会话恢复
+- 持久化后台队列
+
+这意味着它更像“最小 job system”，而不只是一个多线程 shell 包装器。
 
 ## 三层压缩
 
@@ -484,3 +520,274 @@ description: Git 工作流与提交前检查方法
 
 - 这个项目中的注释、文档字符串和 `README` 统一使用中文
 - 标识符和接口字段是否保持英文，以代码可读性和协议兼容性为准
+
+## Agent Team
+
+当前项目已经接入一层最小可用的持久 teammate 机制，用来覆盖“不是一次性 fresh-context 子代理，而是有身份、有历史、能反复协作的 Agent”。
+
+### 设计目标
+
+- 跨多轮对话存活
+- 明确的 Agent 身份和生命周期
+- Agent 之间的文件式通信通道
+
+### 为什么这样实现
+
+这次没有把 team 能力硬塞进 `AgentLoop`，而是故意拆成外层子系统：
+
+- `AgentLoop`
+  继续只负责“单个 Agent 的一次循环”
+- `TeamManager`
+  负责 teammate 的身份、元数据、持久化历史和 roster
+- `MessageBus`
+  负责 `.team/inbox/*.jsonl` 里的消息收发
+- `TeamAgentRunner`
+  负责“读取某个 teammate 的 inbox -> 跑一轮 -> 自动回发结果”
+
+这样拆的原因是：
+
+- 单 Agent 运行逻辑还能继续复用
+- 一次性 subagent 和持久 teammate 的语义不会混在一起
+- 后续要扩成真正常驻的 team host 时，不需要重写底层 loop
+
+### 持久化目录
+
+当前 team 相关状态都放在项目根目录下的 `.team/`：
+
+```text
+.team/
+  config.json
+  agents/
+    lead.json
+    alice.json
+    bob.json
+  inbox/
+    lead.jsonl
+    alice.jsonl
+    bob.jsonl
+  history/
+    lead.json
+    alice.json
+    bob.json
+  sessions/
+    lead.jsonl
+    alice.jsonl
+    bob.jsonl
+```
+
+各目录含义：
+
+- `config.json`
+  team roster 摘要，记录角色、生命周期状态和待处理消息数
+- `agents/*.json`
+  单个 teammate 的元数据
+- `inbox/*.jsonl`
+  Agent 之间的 append-only 消息通道
+- `history/*.json`
+  每个 teammate 的完整持久化对话历史
+- `sessions/*.jsonl`
+  每个 teammate 运行时追加日志，便于排查
+
+### 生命周期
+
+当前 teammate 生命周期是：
+
+```text
+spawn -> idle -> working -> idle -> ... -> shutdown
+```
+
+当前版本支持的状态：
+
+- `idle`
+- `working`
+- `shutdown`
+
+说明：
+
+- `team_spawn_agent` 创建的新 teammate 默认进入 `idle`
+- `team_run_agent` 运行时会临时切到 `working`
+- 运行结束后回到 `idle`
+- `team_shutdown_agent` 会把某个 teammate 永久标记为 `shutdown`
+
+### 通信模型
+
+当前消息总线是“每个 Agent 一个 inbox 文件”的最小实现：
+
+- 发送消息：直接 append 到目标 Agent 的 `inbox/<agent_id>.jsonl`
+- 运行 teammate：先 drain 自己的 inbox，再把这些消息注入自己的历史
+
+消息格式至少包含：
+
+- `messageId`
+- `from`
+- `to`
+- `type`
+- `content`
+- `createdAt`
+
+当前支持的消息类型：
+
+- `task`
+- `note`
+- `result`
+
+### 当前工具
+
+父 Agent 现在额外拥有这些 team 工具：
+
+- `team_spawn_agent`
+- `team_list_agents`
+- `team_get_agent`
+- `team_send_message`
+- `team_peek_inbox`
+- `team_run_agent`
+- `team_shutdown_agent`
+
+其中：
+
+- `team_spawn_agent`
+  创建一个有固定身份和持久历史的 teammate
+- `team_send_message`
+  给某个 teammate 发任务、备注或结果
+- `team_run_agent`
+  让某个 teammate drain 自己的 inbox，并沿用持久历史跑一轮
+- `team_run_agent`
+  跑完后会自动把最终结果作为 `result` 消息回发给原发送方
+
+### 当前 teammate 拥有的工具
+
+teammate 运行时不会拿到全部父工具，只拿到适合长期协作的基础能力：
+
+- `team_send_message`
+- `team_list_agents`
+- `team_get_agent`
+- `compact`
+- `load_skill`
+- `read_file`
+- `write_file`
+- `edit_file`
+- `shell`
+
+当前故意不提供给 teammate：
+
+- `team_spawn_agent`
+- `team_run_agent`
+- `team_shutdown_agent`
+- `task`
+- `task graph`
+- `background jobs`
+
+原因是先把边界收窄，避免“持久 teammate 又递归创建 teammate / 子代理 / 共享任务图”导致状态混乱。
+
+### 当前限制
+
+这版是“最小可用 team”，还不是最终形态。
+
+当前限制包括：
+
+- teammate 不是常驻线程或常驻进程
+- 只有在显式调用 `team_run_agent` 时，它才会处理自己的 inbox
+- inbox 是 read + drain 模式，没有 ack、retry 或 dead-letter queue
+- `lead` 是内建身份，主交互 Agent 发送 team 消息时默认以 `lead` 身份发送
+- 一个 teammate 同一时刻只允许一个 `working`
+- 自动回信是最小策略：本轮如果处理了别人发来的非 `result` 消息，结束时就把最终文本统一回发给发送方
+
+## Agent Team 后续改进
+
+为了避免后面忘记，这里把下一阶段最值得做的升级路线写死。
+
+### 1. 真正的持久 Agent Host
+
+当前 teammate 只是“持久状态 + 手动 run once”，还不是真正常驻 Agent。
+后面可以加：
+
+- `run_team_host(agent_id)`
+- 持续轮询 inbox
+- 自动从 `idle` 进入 `working`
+- 处理完后回到 `idle`
+
+这样 teammate 就会更像真正长期存活的 Agent。
+
+### 2. inbox 从 drain 升级为 ack
+
+当前 inbox 是：
+
+- append-only
+- run 时 read + drain
+
+这个实现简单，但缺点是：
+
+- 中途崩溃时可能丢消息
+- 不能重试
+
+后面更稳的做法是：
+
+- 先读取消息
+- 标记为 inflight
+- 成功处理后再 ack
+- 失败时可以重试或进入死信队列
+
+### 3. 引入 outbox / 事件流
+
+当前主要是 inbox 通道。
+后面可以补：
+
+- `outbox/`
+- 统一事件日志
+- 结果、告警、阻塞、完成事件分流
+
+这样更适合做 team 可视化和问题追踪。
+
+### 4. teammate 级别的任务图联动
+
+当前 `.tasks/` 是项目级任务图，team 还没和它自动联动。
+后面可以做：
+
+- teammate 完成消息后自动建议 `task_update`
+- task graph 里的 ready 节点自动分发给某个 teammate
+- teammate 完成后自动解锁下游任务
+
+### 5. team 与后台任务系统联动
+
+当前后台 job 和 team 是分开的。
+后面可以做：
+
+- teammate 启动后台 job
+- teammate 等待 job 完成消息
+- job 完成后自动投递到对应 teammate inbox
+
+这样适合长时间测试、构建和扫描任务。
+
+### 6. teammate 权限分层
+
+当前 teammate 的工具集还是静态的。
+后面可以给不同角色不同权限，例如：
+
+- researcher：偏读、偏总结
+- coder：允许写文件
+- reviewer：以只读为主
+
+再进一步，可以把 shell 的 `read_only / dev_safe / dangerous` 权限档位也接到 teammate 身上。
+
+### 7. 更好的结果路由
+
+当前 `team_run_agent` 的自动回发策略比较粗。
+后面可以升级成：
+
+- 针对不同 sender 分别总结
+- 针对不同消息类型采用不同 reply 策略
+- 支持显式 `reply_to`
+- 支持多跳协作链路
+
+### 8. 可视化 team 面板
+
+当前主要靠工具文本查看状态。
+后面可以加统一面板，集中显示：
+
+- 当前有哪些 teammate
+- 各自状态
+- inbox 消息数
+- 最近一次结果
+- 最近一次失败
+
+这样 team 会更好调试，也更接近真正可用的协作运行时。

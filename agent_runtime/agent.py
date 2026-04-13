@@ -9,6 +9,7 @@ from .compaction import ConversationCompactor
 from .llm.base import BaseLLMClient
 from .session_log import SessionLogger
 from .task_graph import TaskGraphManager
+from .background_jobs import BackgroundJobManager
 from .todo import TodoManager
 from .tools.base import ToolRegistry
 from .types import AgentRunResult, ConversationMessage
@@ -25,6 +26,7 @@ class AgentLoop:
     echo_tool_calls: bool = True
     todo_manager: TodoManager | None = None
     task_graph_manager: TaskGraphManager | None = None
+    background_job_manager: BackgroundJobManager | None = None
     compactor: ConversationCompactor | None = None
     session_logger: SessionLogger | None = None
     log_scope: str = "parent"
@@ -51,6 +53,7 @@ class AgentLoop:
                 if self.task_graph_manager is not None
                 else None
             )
+            self._inject_background_job_events(messages)
 
             if self.compactor is not None and self.compactor.should_auto_compact(
                 messages=messages,
@@ -208,3 +211,28 @@ class AgentLoop:
         messages.append(message)
         if self.session_logger is not None:
             self.session_logger.append_message(message, scope=self.log_scope)
+
+    def _inject_background_job_events(self, messages: list[ConversationMessage]) -> None:
+        """把已完成后台任务结果注入到主历史。
+
+        注入时机放在每次调用 LLM 前，而不是后台线程直接改历史。
+        这样上下文仍然只由主线程修改，状态更稳定。
+        """
+
+        if self.background_job_manager is None:
+            return
+
+        events = self.background_job_manager.drain_completed_events()
+        for event in events:
+            message = ConversationMessage(
+                role="user",
+                content=(
+                    "<background_job_result>\n"
+                    f"job_id: {event.job_id}\n"
+                    f"status: {event.status}\n"
+                    f"command: {event.command}\n"
+                    f"output:\n{event.output}\n"
+                    "</background_job_result>"
+                ),
+            )
+            self._append_message(messages, message)

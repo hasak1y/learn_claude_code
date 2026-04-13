@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 
 from agent_runtime.agent import AgentLoop
+from agent_runtime.background_jobs import BackgroundJobManager
 from agent_runtime.compaction import ConversationCompactor
 from agent_runtime.config import load_openai_compatible_config
 from agent_runtime.llm import OpenAICompatibleLLMClient
@@ -15,7 +17,13 @@ from agent_runtime.session_log import SessionLogger
 from agent_runtime.skills import SkillRegistry
 from agent_runtime.subagents import SubagentRunner
 from agent_runtime.task_graph import TaskGraphManager
+from agent_runtime.team import TeamAgentRunner, TeamManager
 from agent_runtime.todo import TodoManager
+from agent_runtime.tools.background_job import (
+    BackgroundShellTool,
+    GetBackgroundJobResultTool,
+    ListBackgroundJobsTool,
+)
 from agent_runtime.tools.base import ToolRegistry
 from agent_runtime.tools.bash import ShellTool
 from agent_runtime.tools.compact import CompactTool
@@ -32,56 +40,90 @@ from agent_runtime.tools.task_graph import (
     ListReadyTasksTool,
     UpdateTaskTool,
 )
+from agent_runtime.tools.team import (
+    GetTeamAgentTool,
+    ListTeamAgentsTool,
+    PeekTeamInboxTool,
+    RunTeamAgentTool,
+    SendTeamMessageTool,
+    ShutdownTeamAgentTool,
+    SpawnTeamAgentTool,
+)
 from agent_runtime.tools.todo import TodoTool
 from agent_runtime.tools.write_file import WriteFileTool
 from agent_runtime.types import ConversationMessage
+
+
+PROMPT_TEXT = "\033[36magent >> \033[0m"
 
 
 def build_system_prompt(skill_registry: SkillRegistry) -> str:
     """构造父 Agent 的系统提示词。"""
 
     return (
-        f"你是一个在 {os.getcwd()} 中运行的编程 Agent。"
-        "需要时使用工具，直接行动，回答保持简洁，任务完成后立刻停止。"
-        "当前提供的是通用 shell 工具，不要假设一定是 Unix bash 环境。"
-        "读取文件时优先使用 read_file。"
-        "创建或整体覆盖文本文件时优先使用 write_file。"
-        "修改已有文件时优先使用 edit_file。"
-        "简单、线性的短任务可使用 todo。"
-        "存在依赖、解锁关系或可并行推进的复杂任务，应优先使用 task graph 工具。"
-        "todo 中同一时刻最多只能有一个 in_progress。"
-        "当某个子任务相对独立、适合单独完成并返回总结时，可以使用 task。"
-        "task 会同步调用一个 fresh context 的子代理，父 Agent 会等待子代理返回最终文本。"
-        "当上下文很长、阶段切换或工具结果累积较多时，可以使用 compact。"
-        "如果用户明确要求执行 compact，那么在收集到完成该轮总结所需的最小信息后，应尽快调用 compact，"
-        "不要继续进行无关或重复的搜索。"
-        "只有在文件类工具不适合时，再退回使用 shell。"
-        "\n\n"
+        f"你是一个在 {os.getcwd()} 中运行的编程 Agent。\n"
+        "需要时使用工具，直接行动，回答保持简洁，任务完成后立刻停止。\n"
+        "当前提供的是通用 shell 工具，不要假设一定是 Unix bash 环境。\n"
+        "读取文件时优先使用 read_file。\n"
+        "创建或整体覆盖文本文件时优先使用 write_file。\n"
+        "修改已有文件时优先使用 edit_file。\n"
+        "简单、线性的短任务可使用 todo。\n"
+        "存在依赖、解锁关系或可并行推进的复杂任务，应优先使用 task graph 工具。\n"
+        "todo 中同一时刻最多只能有一个 in_progress。\n"
+        "如果某个 shell 命令预计会运行很久，例如 npm install、pytest 或 docker build，应优先使用 shell_background 把它放到后台，再继续做别的工作。\n"
+        "后台任务完成后，结果会在下一次调用模型前自动注入。\n"
+        "当某个子任务相对独立、适合单独完成并返回总结时，可以使用 task。\n"
+        "task 会同步调用一个 fresh context 的子代理，父 Agent 会等待子代理返回最终文本。\n"
+        "当你需要创建可跨多轮存活、拥有固定身份和独立历史的 teammate 时，使用 team_spawn_agent。\n"
+        "当你需要把任务、备注或结果发给 teammate 时，使用 team_send_message。\n"
+        "当你需要让某个 teammate 处理它自己的 inbox 时，使用 team_run_agent。\n"
+        "team_list_agents、team_get_agent 和 team_peek_inbox 用来查看 team roster、生命周期状态和待处理消息。\n"
+        "team_shutdown_agent 用来结束某个 teammate 的生命周期。\n"
+        "teammate 和一次性 fresh-context 的 task 子代理不同：前者有持久历史和身份，后者只做单次委派。\n"
+        "当上下文很长、阶段切换或工具结果累积较多时，可以使用 compact。\n"
+        "如果用户明确要求执行 compact，那么在收集到完成该轮总结所需的最小信息后，应尽快调用 compact，不要继续进行无关或重复的搜索。\n"
+        "只有在文件类工具不适合时，再退回使用 shell。\n\n"
         f"{skill_registry.build_prompt_index()}"
     )
 
 
 def build_subagent_system_prompt(skill_registry: SkillRegistry) -> str:
-    """构造子代理使用的系统提示词。"""
+    """构造一次性子代理使用的系统提示词。"""
 
     return (
-        f"你是一个在 {os.getcwd()} 中运行的子代理。"
-        "你拥有 fresh context，只负责当前被委派的单个子任务。"
-        "你没有 task 工具，也没有 task graph 工具，不能继续创建新的子代理或改动父任务图。"
-        "需要时使用工具，任务完成后返回简洁的最终结论。"
-        "读取文件时优先使用 read_file。"
-        "创建或整体覆盖文本文件时优先使用 write_file。"
-        "修改已有文件时优先使用 edit_file。"
-        "必要时可以使用 compact 来收缩上下文。"
-        "如果当前任务已经明确要求 compact，在拿到必要信息后应尽快执行，不要继续无关搜索。"
-        "只有在文件类工具不适合时，再退回使用 shell。"
-        "\n\n"
+        f"你是一个在 {os.getcwd()} 中运行的子代理。\n"
+        "你拥有 fresh context，只负责当前被委派的单个子任务。\n"
+        "你没有 task 工具，也没有 task graph 工具，不能继续创建新的子代理或改动父任务图。\n"
+        "需要时使用工具，任务完成后返回简洁的最终结论。\n"
+        "读取文件时优先使用 read_file。\n"
+        "创建或整体覆盖文本文件时优先使用 write_file。\n"
+        "修改已有文件时优先使用 edit_file。\n"
+        "必要时可以使用 compact 来收缩上下文。\n"
+        "如果当前任务已经明确要求 compact，在拿到必要信息后应尽快执行，不要继续无关搜索。\n"
+        "只有在文件类工具不适合时，再退回使用 shell。\n\n"
+        f"{skill_registry.build_prompt_index()}"
+    )
+
+
+def build_team_agent_base_prompt(skill_registry: SkillRegistry) -> str:
+    """构造持久 teammate 的通用基础提示词。"""
+
+    return (
+        f"你是一个在 {os.getcwd()} 中运行的持久 teammate。\n"
+        "你会跨多轮处理自己的 inbox 任务，并保留自己的历史。\n"
+        "需要时使用工具，回答保持简洁。\n"
+        "如果需要把结论、阻塞或协作请求发送给其他 teammate，请使用 team_send_message。\n"
+        "读取文件时优先使用 read_file。\n"
+        "创建或整体覆盖文本文件时优先使用 write_file。\n"
+        "修改已有文件时优先使用 edit_file。\n"
+        "必要时可以使用 compact 来收缩上下文。\n"
+        "只有在文件类工具不适合时，再退回使用 shell。\n\n"
         f"{skill_registry.build_prompt_index()}"
     )
 
 
 def build_child_tool_registry(skill_registry: SkillRegistry) -> ToolRegistry:
-    """构造子代理使用的工具集合。"""
+    """构造一次性子代理使用的工具集合。"""
 
     return ToolRegistry(
         [
@@ -95,11 +137,38 @@ def build_child_tool_registry(skill_registry: SkillRegistry) -> ToolRegistry:
     )
 
 
+def build_team_agent_tool_registry(
+    *,
+    skill_registry: SkillRegistry,
+    team_manager: TeamManager,
+    sender_id: str,
+) -> ToolRegistry:
+    """构造持久 teammate 运行时使用的工具集合。"""
+
+    return ToolRegistry(
+        [
+            CompactTool(),
+            LoadSkillTool(skill_registry=skill_registry),
+            SendTeamMessageTool(manager=team_manager, sender_id=sender_id),
+            ListTeamAgentsTool(manager=team_manager),
+            GetTeamAgentTool(manager=team_manager),
+            ReadFileTool(cwd=os.getcwd()),
+            WriteFileTool(cwd=os.getcwd()),
+            EditFileTool(cwd=os.getcwd()),
+            ShellTool(cwd=os.getcwd()),
+        ]
+    )
+
+
 def build_parent_tool_registry(
+    *,
     todo_manager: TodoManager,
     subagent_runner: SubagentRunner,
     skill_registry: SkillRegistry,
     task_graph_manager: TaskGraphManager,
+    background_job_manager: BackgroundJobManager,
+    team_manager: TeamManager,
+    team_runner: TeamAgentRunner,
 ) -> ToolRegistry:
     """构造父 Agent 使用的工具集合。"""
 
@@ -113,6 +182,16 @@ def build_parent_tool_registry(
             ListReadyTasksTool(manager=task_graph_manager),
             ListBlockedTasksTool(manager=task_graph_manager),
             ListCompletedTasksTool(manager=task_graph_manager),
+            BackgroundShellTool(manager=background_job_manager),
+            ListBackgroundJobsTool(manager=background_job_manager),
+            GetBackgroundJobResultTool(manager=background_job_manager),
+            SpawnTeamAgentTool(manager=team_manager),
+            ListTeamAgentsTool(manager=team_manager),
+            GetTeamAgentTool(manager=team_manager),
+            SendTeamMessageTool(manager=team_manager, sender_id="lead"),
+            PeekTeamInboxTool(manager=team_manager),
+            RunTeamAgentTool(runner=team_runner),
+            ShutdownTeamAgentTool(manager=team_manager),
             TaskTool(runner=subagent_runner),
             CompactTool(),
             LoadSkillTool(skill_registry=skill_registry),
@@ -140,6 +219,9 @@ def main() -> None:
     skill_registry = SkillRegistry(root=os.path.join(os.getcwd(), "skills"))
     todo_manager = TodoManager(reminder_threshold=3)
     task_graph_manager = TaskGraphManager(tasks_dir=Path(os.getcwd()) / ".tasks")
+    background_job_manager = BackgroundJobManager(cwd=os.getcwd())
+    team_manager = TeamManager(root=Path(os.getcwd()) / ".team")
+
     session_id = f"session_{int(time.time() * 1000)}"
     session_logger = SessionLogger(
         session_id=session_id,
@@ -157,11 +239,26 @@ def main() -> None:
         compactor=compactor,
         session_logger=session_logger,
     )
+    team_runner = TeamAgentRunner(
+        team_manager=team_manager,
+        llm_client_factory=lambda: OpenAICompatibleLLMClient(config),
+        tool_registry_factory=lambda agent_id: build_team_agent_tool_registry(
+            skill_registry=skill_registry,
+            team_manager=team_manager,
+            sender_id=agent_id,
+        ),
+        base_system_prompt_builder=lambda _agent_id: build_team_agent_base_prompt(skill_registry),
+        max_steps=12,
+        compactor=compactor,
+    )
     tool_registry = build_parent_tool_registry(
         todo_manager=todo_manager,
         subagent_runner=subagent_runner,
         skill_registry=skill_registry,
         task_graph_manager=task_graph_manager,
+        background_job_manager=background_job_manager,
+        team_manager=team_manager,
+        team_runner=team_runner,
     )
     agent = AgentLoop(
         llm_client=llm_client,
@@ -171,6 +268,7 @@ def main() -> None:
         echo_tool_calls=True,
         todo_manager=todo_manager,
         task_graph_manager=task_graph_manager,
+        background_job_manager=background_job_manager,
         compactor=compactor,
         session_logger=session_logger,
         log_scope="parent",
@@ -180,7 +278,11 @@ def main() -> None:
 
     while True:
         try:
-            user_input = input("\033[36magent >> \033[0m").strip()
+            # 显式输出提示符，再读取裸 input，可以避开某些终端环境下
+            # `input(prompt)` 配合 ANSI 颜色时出现重复渲染提示符的问题。
+            sys.stdout.write(PROMPT_TEXT)
+            sys.stdout.flush()
+            user_input = input().strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break

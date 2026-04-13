@@ -5,3 +5,4 @@ __pycache__/
 .sessions/
 .transcripts/
 .tasks/
+.team/
