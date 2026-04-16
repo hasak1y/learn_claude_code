@@ -92,7 +92,23 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
         for attempt in range(1, max_attempts + 1):
             try:
                 with request.urlopen(http_request, timeout=self.config.timeout_seconds) as response:
-                    return response.read().decode("utf-8")
+                    try:
+                        return response.read().decode("utf-8")
+                    except http.client.IncompleteRead as exc:
+                        partial = exc.partial or b""
+                        if partial:
+                            # 某些中转服务在 SSE 尾部会异常断开。
+                            # 只要已经拿到部分响应，就优先尝试用已收数据继续解析，
+                            # 避免工具已经执行完成却因为流尾不完整而整轮崩溃。
+                            return partial.decode("utf-8", errors="ignore")
+                        last_error = exc
+                        if attempt < max_attempts:
+                            time.sleep(0.8 * attempt)
+                            continue
+                        raise RuntimeError(
+                            "LLM 流式响应在传输过程中被中断，且没有收到可恢复的内容。"
+                            f"请求地址：{url}；原始错误：{exc}"
+                        ) from exc
             except HTTPError as exc:
                 error_body = exc.read().decode("utf-8", errors="replace")
                 error_message = (
@@ -113,6 +129,7 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
                 URLError,
                 TimeoutError,
                 ConnectionResetError,
+                http.client.IncompleteRead,
                 http.client.RemoteDisconnected,
             ) as exc:
                 last_error = exc

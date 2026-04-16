@@ -6,14 +6,14 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .compaction import ConversationCompactor
+from .hooks import HookContext, HookManager, HookResult
 from .llm.base import BaseLLMClient
-from .permissions import ApprovalCallback, PermissionPolicy
 from .session_log import SessionLogger
 from .task_graph import TaskGraphManager
 from .background_jobs import BackgroundJobManager
 from .todo import TodoManager
 from .tools.base import ToolRegistry
-from .types import AgentRunResult, ConversationMessage, ToolCall
+from .types import AgentRunResult, ConversationMessage
 
 
 @dataclass(slots=True)
@@ -31,8 +31,7 @@ class AgentLoop:
     compactor: ConversationCompactor | None = None
     session_logger: SessionLogger | None = None
     log_scope: str = "parent"
-    permission_policy: PermissionPolicy | None = None
-    approval_callback: ApprovalCallback | None = None
+    hook_manager: HookManager | None = None
 
     def run(
         self,
@@ -56,12 +55,29 @@ class AgentLoop:
                 if self.task_graph_manager is not None
                 else None
             )
-            self._inject_background_job_events(messages)
+            before_request_result = self._emit_hook(
+                HookContext(
+                    event="before_llm_request",
+                    messages=messages,
+                    step_index=step_index,
+                    extras={"system_prompt": self.system_prompt},
+                )
+            )
+            request_messages = list(messages)
+            request_messages.extend(before_request_result.request_messages)
 
             if self.compactor is not None and self.compactor.should_auto_compact(
                 messages=messages,
                 system_prompt=self.system_prompt,
             ):
+                self._emit_hook(
+                    HookContext(
+                        event="before_compact",
+                        messages=messages,
+                        step_index=step_index,
+                        extras={"reason": "auto"},
+                    )
+                )
                 compact_result = self.compactor.compact_history(
                     messages=messages,
                     llm_client=self.llm_client,
@@ -74,8 +90,16 @@ class AgentLoop:
                 )
                 if self.echo_tool_calls:
                     print(f"[auto_compact] {compact_result}")
+                self._emit_hook(
+                    HookContext(
+                        event="after_compact",
+                        messages=messages,
+                        step_index=step_index,
+                        tool_output=compact_result,
+                        extras={"reason": "auto"},
+                    )
+                )
 
-            request_messages = list(messages)
             if self.todo_manager is not None and self.todo_manager.should_remind():
                 request_messages.append(
                     ConversationMessage(
@@ -95,6 +119,14 @@ class AgentLoop:
                 system_prompt=self.system_prompt,
             )
             self._append_message(messages, response.message)
+            self._emit_hook(
+                HookContext(
+                    event="after_llm_response",
+                    messages=messages,
+                    step_index=step_index,
+                    llm_response_message=response.message,
+                )
+            )
 
             if not response.message.tool_calls:
                 if self.todo_manager is not None:
@@ -120,40 +152,58 @@ class AgentLoop:
                 if self.echo_tool_calls:
                     print(f"\033[33m[{step_index}] $ {tool_call.name} {tool_call.arguments}\033[0m")
 
-                if tool_call.name == "compact" and self.compactor is not None:
+                before_tool_result = self._emit_hook(
+                    HookContext(
+                        event="before_tool_execute",
+                        messages=messages,
+                        step_index=step_index,
+                        tool_call=tool_call,
+                    )
+                )
+
+                if before_tool_result.decision == "abort":
+                    tool_output = before_tool_result.reason or "操作已中止。"
+                elif before_tool_result.decision == "skip":
+                    tool_output = before_tool_result.reason or "操作已跳过。"
+                elif tool_call.name == "compact" and self.compactor is not None:
                     current_task_graph_summary = (
                         self.task_graph_manager.render_summary()
                         if self.task_graph_manager is not None
                         else None
                     )
-
-                    def _execute_compact() -> str:
-                        return self.compactor.compact_history(
+                    self._emit_hook(
+                        HookContext(
+                            event="before_compact",
                             messages=messages,
-                            llm_client=self.llm_client,
-                            system_prompt=self.system_prompt,
-                            todo_manager=self.todo_manager,
-                            reason="manual",
-                            session_logger=self.session_logger,
-                            log_scope=self.log_scope,
-                            task_graph_summary=current_task_graph_summary,
+                            step_index=step_index,
+                            tool_call=tool_call,
+                            extras={"reason": "manual"},
                         )
-
-                    tool_output = self._execute_with_permission_check(
-                        tool_call=tool_call,
-                        executor=_execute_compact,
+                    )
+                    tool_output = self.compactor.compact_history(
+                        messages=messages,
+                        llm_client=self.llm_client,
+                        system_prompt=self.system_prompt,
+                        todo_manager=self.todo_manager,
+                        reason="manual",
+                        session_logger=self.session_logger,
+                        log_scope=self.log_scope,
+                        task_graph_summary=current_task_graph_summary,
+                    )
+                    self._emit_hook(
+                        HookContext(
+                            event="after_compact",
+                            messages=messages,
+                            step_index=step_index,
+                            tool_call=tool_call,
+                            tool_output=tool_output,
+                            extras={"reason": "manual"},
+                        )
                     )
                 else:
-
-                    def _execute_tool() -> str:
-                        return self.tool_registry.execute(
-                            name=tool_call.name,
-                            arguments=tool_call.arguments,
-                        )
-
-                    tool_output = self._execute_with_permission_check(
-                        tool_call=tool_call,
-                        executor=_execute_tool,
+                    tool_output = self.tool_registry.execute(
+                        name=tool_call.name,
+                        arguments=tool_call.arguments,
                     )
 
                 if tool_call.name in {"todo", "task_create", "task_update"}:
@@ -173,6 +223,15 @@ class AgentLoop:
                         tool_call_id=tool_call.id,
                         name=tool_call.name,
                     ),
+                )
+                self._emit_hook(
+                    HookContext(
+                        event="after_tool_execute",
+                        messages=messages,
+                        step_index=step_index,
+                        tool_call=tool_call,
+                        tool_output=tool_output,
+                    )
                 )
 
             if self.todo_manager is not None:
@@ -229,53 +288,13 @@ class AgentLoop:
         if self.session_logger is not None:
             self.session_logger.append_message(message, scope=self.log_scope)
 
-    def _execute_with_permission_check(
-        self,
-        tool_call: ToolCall,
-        executor: Callable[[], str],
-    ) -> str:
-        """执行工具前先做权限检查与用户确认。"""
+    def _emit_hook(self, ctx: HookContext) -> HookResult:
+        """统一触发 hook，并把需要落入历史的消息写回主状态。"""
 
-        if self.permission_policy is None:
-            return executor()
+        if self.hook_manager is None:
+            return HookResult()
 
-        result = self.permission_policy.evaluate(tool_call)
-        if result.decision == "deny":
-            return f"已拒绝执行：{result.reason}"
-
-        if result.decision == "allow":
-            return executor()
-
-        if self.approval_callback is None:
-            return "需要用户确认，但当前没有可用的确认回调。"
-
-        approved = self.approval_callback(tool_call, result)
-        if not approved:
-            return "用户拒绝执行该操作。"
-
-        return executor()
-
-    def _inject_background_job_events(self, messages: list[ConversationMessage]) -> None:
-        """把已完成后台任务结果注入到主历史。
-
-        注入时机放在每次调用 LLM 前，而不是后台线程直接改历史。
-        这样上下文仍然只由主线程修改，状态更稳定。
-        """
-
-        if self.background_job_manager is None:
-            return
-
-        events = self.background_job_manager.drain_completed_events()
-        for event in events:
-            message = ConversationMessage(
-                role="user",
-                content=(
-                    "<background_job_result>\n"
-                    f"job_id: {event.job_id}\n"
-                    f"status: {event.status}\n"
-                    f"command: {event.command}\n"
-                    f"output:\n{event.output}\n"
-                    "</background_job_result>"
-                ),
-            )
-            self._append_message(messages, message)
+        result = self.hook_manager.emit(ctx)
+        for message in result.append_messages:
+            self._append_message(messages=ctx.messages, message=message)
+        return result

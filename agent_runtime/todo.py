@@ -49,7 +49,10 @@ class TodoManager:
     def should_remind(self) -> bool:
         """判断当前是否应该注入任务跟踪提醒。"""
 
-        return self.rounds_since_tracking_update >= self.reminder_threshold
+        return (
+            self.has_active_items()
+            and self.rounds_since_tracking_update >= self.reminder_threshold
+        )
 
     def build_reminder(self, task_graph_summary: str | None = None) -> str:
         """生成注入给模型的提醒文本。
@@ -59,11 +62,10 @@ class TodoManager:
         """
 
         lines = [
-            "<reminder>请检查并更新任务跟踪信息。",
-            "简单任务可使用 todo 列表。",
-            "存在依赖、解锁关系或可并行推进的复杂任务，应使用 task graph 工具。",
-            "todo 中同一时刻最多只能有一个 in_progress。",
-            "</reminder>",
+            "运行时提示：如果当前任务仍然存在多个未完成步骤，可顺手检查任务跟踪信息是否需要更新。",
+            "如果任务已经完成，或当前回复不需要任务拆解，可忽略这条提醒，不必专门为此调用工具。",
+            "简单任务可使用 todo 列表；存在依赖、解锁关系或可并行推进的复杂任务，再考虑使用 task graph 工具。",
+            "只有在任务状态确实发生变化时，才需要更新 todo；todo 中同一时刻最多只能有一个 in_progress。",
         ]
 
         if self.items:
@@ -97,6 +99,11 @@ class TodoManager:
             f"{status_mark[item.status]} {item.content}"
             for item in self.items
         )
+
+    def has_active_items(self) -> bool:
+        """判断当前是否还有未完成的 todo 项。"""
+
+        return any(item.status != "completed" for item in self.items)
 
     @staticmethod
     def _validate(items: list[TodoItem]) -> None:

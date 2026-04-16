@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .types import ConversationMessage
+from .types import ConversationMessage, ToolCall
 
 
 @dataclass(slots=True)
@@ -57,3 +57,65 @@ class SessionLogger:
         with self._lock:
             with self.path.open("a", encoding="utf-8") as file:
                 file.write(line + "\n")
+
+
+def load_latest_parent_history(session_dir: Path) -> tuple[list[ConversationMessage], Path | None]:
+    """从最近一次 session log 恢复主 Agent 的历史。
+
+    这是“最小持久记忆恢复”：
+    - 只读取 `.sessions/` 下最近修改的一个 jsonl
+    - 只恢复 `scope=parent` 的消息
+    - 把日志重新还原成 ConversationMessage 列表
+    """
+
+    if not session_dir.exists():
+        return [], None
+
+    candidates = sorted(
+        session_dir.glob("session_*.jsonl"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        return [], None
+
+    latest_path = candidates[0]
+    history: list[ConversationMessage] = []
+
+    for raw_line in latest_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if payload.get("scope") != "parent":
+            continue
+
+        tool_calls = [
+            ToolCall(
+                id=str(item.get("id", "")),
+                name=str(item.get("name", "")),
+                arguments=dict(item.get("arguments", {})),  # type: ignore[arg-type]
+            )
+            for item in payload.get("tool_calls", [])  # type: ignore[arg-type]
+        ]
+
+        history.append(
+            ConversationMessage(
+                role=str(payload.get("role", "user")),  # type: ignore[arg-type]
+                content=str(payload.get("content", "")),
+                tool_call_id=(
+                    str(payload["tool_call_id"])
+                    if payload.get("tool_call_id") is not None
+                    else None
+                ),
+                name=str(payload["name"]) if payload.get("name") is not None else None,
+                tool_calls=tool_calls,
+            )
+        )
+
+    return history, latest_path

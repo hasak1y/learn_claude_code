@@ -12,8 +12,10 @@ from agent_runtime.agent import AgentLoop
 from agent_runtime.background_jobs import BackgroundJobManager
 from agent_runtime.compaction import ConversationCompactor
 from agent_runtime.config import load_openai_compatible_config
+from agent_runtime.hooks import HookManager
 from agent_runtime.llm import OpenAICompatibleLLMClient
-from agent_runtime.session_log import SessionLogger
+from agent_runtime.runtime_hooks import BackgroundJobHook, PermissionHook
+from agent_runtime.session_log import SessionLogger, load_latest_parent_history
 from agent_runtime.skills import SkillRegistry
 from agent_runtime.subagents import SubagentRunner
 from agent_runtime.task_graph import TaskGraphManager
@@ -282,11 +284,13 @@ def main() -> None:
     task_graph_manager = TaskGraphManager(tasks_dir=Path(os.getcwd()) / ".tasks")
     background_job_manager = BackgroundJobManager(cwd=os.getcwd())
     team_manager = TeamManager(root=Path(os.getcwd()) / ".team")
+    sessions_dir = Path(os.getcwd()) / ".sessions"
+    restored_history, restored_from = load_latest_parent_history(sessions_dir)
 
     session_id = f"session_{int(time.time() * 1000)}"
     session_logger = SessionLogger(
         session_id=session_id,
-        path=Path(os.getcwd()) / ".sessions" / f"{session_id}.jsonl",
+        path=sessions_dir / f"{session_id}.jsonl",
     )
     compactor = ConversationCompactor(
         transcript_dir=Path(os.getcwd()) / ".transcripts",
@@ -321,6 +325,14 @@ def main() -> None:
         team_manager=team_manager,
         team_runner=team_runner,
     )
+    hook_manager = HookManager(
+        {
+            "before_llm_request": [BackgroundJobHook(background_job_manager)],
+            "before_tool_execute": [
+                PermissionHook(permission_policy, _prompt_user_approval)
+            ],
+        }
+    )
     agent = AgentLoop(
         llm_client=llm_client,
         tool_registry=tool_registry,
@@ -333,11 +345,14 @@ def main() -> None:
         compactor=compactor,
         session_logger=session_logger,
         log_scope="parent",
-        permission_policy=permission_policy,
-        approval_callback=_prompt_user_approval,
+        hook_manager=hook_manager,
     )
 
-    history: list[ConversationMessage] = []
+    history: list[ConversationMessage] = list(restored_history)
+    if restored_from is not None and history:
+        print(
+            f"[session_resume] 已从 {restored_from.name} 恢复主历史，共 {len(history)} 条消息。"
+        )
 
     while True:
         try:
