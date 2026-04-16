@@ -19,6 +19,7 @@ from agent_runtime.subagents import SubagentRunner
 from agent_runtime.task_graph import TaskGraphManager
 from agent_runtime.team import TeamAgentRunner, TeamManager
 from agent_runtime.todo import TodoManager
+from agent_runtime.permissions import PermissionPolicy
 from agent_runtime.tools.background_job import (
     BackgroundShellTool,
     GetBackgroundJobResultTool,
@@ -55,6 +56,59 @@ from agent_runtime.types import ConversationMessage
 
 
 PROMPT_TEXT = "\033[36magent >> \033[0m"
+APPROVAL_TIMEOUT_SECONDS = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "30"))
+
+
+def _input_with_timeout(prompt: str, timeout_seconds: int) -> str | None:
+    """带超时的输入，超时返回 None。"""
+
+    if timeout_seconds <= 0:
+        return input(prompt)
+
+    import queue
+    import threading
+
+    result_queue: queue.Queue[str] = queue.Queue(maxsize=1)
+
+    def _reader() -> None:
+        try:
+            result_queue.put(input(prompt))
+        except Exception:
+            result_queue.put("")
+
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+
+    try:
+        return result_queue.get(timeout=timeout_seconds)
+    except queue.Empty:
+        return None
+
+
+def _prompt_user_approval(tool_call: object, decision: object) -> bool:
+    """在终端提示用户确认敏感操作。"""
+
+    try:
+        name = getattr(tool_call, "name", "unknown")
+        arguments = getattr(tool_call, "arguments", {})
+        reason = getattr(decision, "reason", "需要确认")
+    except Exception:
+        name = "unknown"
+        arguments = {}
+        reason = "需要确认"
+
+    print("\n[权限确认] 该操作需要用户确认：")
+    print(f"- 工具：{name}")
+    print(f"- 原因：{reason}")
+    print(f"- 参数：{arguments}")
+    answer = _input_with_timeout(
+        f"是否允许执行？(y/n) [超时 {APPROVAL_TIMEOUT_SECONDS}s 默认拒绝]: ",
+        APPROVAL_TIMEOUT_SECONDS,
+    )
+    if answer is None:
+        print("权限确认超时，默认拒绝。")
+        return False
+    return answer.strip().lower() in {"y", "yes"}
 
 
 def build_system_prompt(skill_registry: SkillRegistry) -> str:
@@ -80,9 +134,14 @@ def build_system_prompt(skill_registry: SkillRegistry) -> str:
         "team_list_agents、team_get_agent 和 team_peek_inbox 用来查看 team roster、生命周期状态和待处理消息。\n"
         "team_shutdown_agent 用来结束某个 teammate 的生命周期。\n"
         "teammate 和一次性 fresh-context 的 task 子代理不同：前者有持久历史和身份，后者只做单次委派。\n"
+        "当前开启了权限审查：敏感操作需要用户确认。\n"
         "当上下文很长、阶段切换或工具结果累积较多时，可以使用 compact。\n"
         "如果用户明确要求执行 compact，那么在收集到完成该轮总结所需的最小信息后，应尽快调用 compact，不要继续进行无关或重复的搜索。\n"
         "只有在文件类工具不适合时，再退回使用 shell。\n\n"
+        "权限审查规则：\n"
+        "- shell 非白名单命令需要用户确认。\n"
+        "- read_only 模式下 write_file / edit_file 会被拒绝。\n"
+        "- dev_safe 模式下 shell_background 仅白名单直接放行，其余需要确认。\n\n"
         f"{skill_registry.build_prompt_index()}"
     )
 
@@ -216,6 +275,8 @@ def main() -> None:
         return
 
     llm_client = OpenAICompatibleLLMClient(config)
+    permission_mode = os.getenv("PERMISSION_MODE", "dev_safe")
+    permission_policy = PermissionPolicy(mode=permission_mode)  # type: ignore[arg-type]
     skill_registry = SkillRegistry(root=os.path.join(os.getcwd(), "skills"))
     todo_manager = TodoManager(reminder_threshold=3)
     task_graph_manager = TaskGraphManager(tasks_dir=Path(os.getcwd()) / ".tasks")
@@ -272,6 +333,8 @@ def main() -> None:
         compactor=compactor,
         session_logger=session_logger,
         log_scope="parent",
+        permission_policy=permission_policy,
+        approval_callback=_prompt_user_approval,
     )
 
     history: list[ConversationMessage] = []

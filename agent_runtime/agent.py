@@ -7,12 +7,13 @@ from typing import Callable
 
 from .compaction import ConversationCompactor
 from .llm.base import BaseLLMClient
+from .permissions import ApprovalCallback, PermissionPolicy
 from .session_log import SessionLogger
 from .task_graph import TaskGraphManager
 from .background_jobs import BackgroundJobManager
 from .todo import TodoManager
 from .tools.base import ToolRegistry
-from .types import AgentRunResult, ConversationMessage
+from .types import AgentRunResult, ConversationMessage, ToolCall
 
 
 @dataclass(slots=True)
@@ -30,6 +31,8 @@ class AgentLoop:
     compactor: ConversationCompactor | None = None
     session_logger: SessionLogger | None = None
     log_scope: str = "parent"
+    permission_policy: PermissionPolicy | None = None
+    approval_callback: ApprovalCallback | None = None
 
     def run(
         self,
@@ -123,20 +126,34 @@ class AgentLoop:
                         if self.task_graph_manager is not None
                         else None
                     )
-                    tool_output = self.compactor.compact_history(
-                        messages=messages,
-                        llm_client=self.llm_client,
-                        system_prompt=self.system_prompt,
-                        todo_manager=self.todo_manager,
-                        reason="manual",
-                        session_logger=self.session_logger,
-                        log_scope=self.log_scope,
-                        task_graph_summary=current_task_graph_summary,
+
+                    def _execute_compact() -> str:
+                        return self.compactor.compact_history(
+                            messages=messages,
+                            llm_client=self.llm_client,
+                            system_prompt=self.system_prompt,
+                            todo_manager=self.todo_manager,
+                            reason="manual",
+                            session_logger=self.session_logger,
+                            log_scope=self.log_scope,
+                            task_graph_summary=current_task_graph_summary,
+                        )
+
+                    tool_output = self._execute_with_permission_check(
+                        tool_call=tool_call,
+                        executor=_execute_compact,
                     )
                 else:
-                    tool_output = self.tool_registry.execute(
-                        name=tool_call.name,
-                        arguments=tool_call.arguments,
+
+                    def _execute_tool() -> str:
+                        return self.tool_registry.execute(
+                            name=tool_call.name,
+                            arguments=tool_call.arguments,
+                        )
+
+                    tool_output = self._execute_with_permission_check(
+                        tool_call=tool_call,
+                        executor=_execute_tool,
                     )
 
                 if tool_call.name in {"todo", "task_create", "task_update"}:
@@ -211,6 +228,32 @@ class AgentLoop:
         messages.append(message)
         if self.session_logger is not None:
             self.session_logger.append_message(message, scope=self.log_scope)
+
+    def _execute_with_permission_check(
+        self,
+        tool_call: ToolCall,
+        executor: Callable[[], str],
+    ) -> str:
+        """执行工具前先做权限检查与用户确认。"""
+
+        if self.permission_policy is None:
+            return executor()
+
+        result = self.permission_policy.evaluate(tool_call)
+        if result.decision == "deny":
+            return f"已拒绝执行：{result.reason}"
+
+        if result.decision == "allow":
+            return executor()
+
+        if self.approval_callback is None:
+            return "需要用户确认，但当前没有可用的确认回调。"
+
+        approved = self.approval_callback(tool_call, result)
+        if not approved:
+            return "用户拒绝执行该操作。"
+
+        return executor()
 
     def _inject_background_job_events(self, messages: list[ConversationMessage]) -> None:
         """把已完成后台任务结果注入到主历史。

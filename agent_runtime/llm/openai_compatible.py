@@ -54,6 +54,8 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
             "messages": self._build_api_messages(messages, system_prompt),
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
+            # 默认开启流式，便于更快拿到响应，同时保持工具调用兼容
+            "stream": True,
         }
 
         # 只有在确实存在工具定义时，才把工具相关字段发给服务端。
@@ -72,9 +74,13 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
 
         http_request = request.Request(url=url, data=body, headers=headers, method="POST")
 
-        raw_response = self._post_with_retries(http_request=http_request, url=url)
+        return self._generate_via_stream(http_request=http_request, url=url)
 
-        data = json.loads(raw_response)
+    def _generate_via_stream(self, http_request: request.Request, url: str) -> LLMResponse:
+        """使用流式输出读取结果，并整理成统一响应结构。"""
+
+        raw_response = self._post_with_retries(http_request=http_request, url=url)
+        data = self._parse_stream_response(raw_response)
         return self._parse_api_response(data)
 
     def _post_with_retries(self, http_request: request.Request, url: str) -> str:
@@ -240,6 +246,99 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
                 tool_calls=tool_calls,
             )
         )
+
+    def _parse_stream_response(self, raw_response: str) -> dict[str, Any]:
+        """解析 OpenAI-compatible 的 SSE 流式内容。"""
+
+        content_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+
+        for line in raw_response.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if not stripped.startswith("data:"):
+                continue
+
+            payload = stripped[5:].strip()
+            if payload == "[DONE]":
+                break
+
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                # 忽略格式不完整的片段，等待后续完整事件
+                continue
+
+            delta = event.get("choices", [{}])[0].get("delta", {})
+            if not delta:
+                continue
+
+            delta_content = delta.get("content")
+            if isinstance(delta_content, str):
+                content_parts.append(delta_content)
+
+            delta_tool_calls = delta.get("tool_calls")
+            if isinstance(delta_tool_calls, list):
+                for tool_chunk in delta_tool_calls:
+                    self._merge_stream_tool_calls(tool_calls, tool_chunk)
+
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "".join(content_parts),
+                        "tool_calls": self._finalize_stream_tool_calls(tool_calls),
+                    }
+                }
+            ]
+        }
+
+    @staticmethod
+    def _merge_stream_tool_calls(
+        tool_calls: list[dict[str, Any]], tool_chunk: dict[str, Any]
+    ) -> None:
+        """把流式 tool_calls 的增量片段合并起来。"""
+
+        index = tool_chunk.get("index")
+        if index is None:
+            return
+
+        while len(tool_calls) <= index:
+            tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+
+        target = tool_calls[index]
+        if tool_chunk.get("id"):
+            target["id"] = tool_chunk["id"]
+
+        function_chunk = tool_chunk.get("function") or {}
+        if function_chunk.get("name"):
+            target["function"]["name"] = function_chunk["name"]
+
+        if "arguments" in function_chunk and function_chunk["arguments"]:
+            target["function"]["arguments"] += function_chunk["arguments"]
+
+    @staticmethod
+    def _finalize_stream_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """清理流式工具调用，保证参数字段存在。"""
+
+        finalized: list[dict[str, Any]] = []
+        for tool_call in tool_calls:
+            function_block = tool_call.get("function") or {}
+            arguments = function_block.get("arguments") or ""
+            if arguments.strip() == "":
+                arguments = "{}"
+            finalized.append(
+                {
+                    "id": tool_call.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": function_block.get("name", ""),
+                        "arguments": arguments,
+                    },
+                }
+            )
+        return finalized
 
     @staticmethod
     def _normalize_message_content(content: Any) -> str:
