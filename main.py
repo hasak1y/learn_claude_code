@@ -59,6 +59,7 @@ from agent_runtime.types import ConversationMessage
 
 PROMPT_TEXT = "\033[36magent >> \033[0m"
 APPROVAL_TIMEOUT_SECONDS = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "30"))
+SESSION_RESUME_MAX_MESSAGES = int(os.getenv("SESSION_RESUME_MAX_MESSAGES", "40"))
 
 
 def _input_with_timeout(prompt: str, timeout_seconds: int) -> str | None:
@@ -285,7 +286,11 @@ def main() -> None:
     background_job_manager = BackgroundJobManager(cwd=os.getcwd())
     team_manager = TeamManager(root=Path(os.getcwd()) / ".team")
     sessions_dir = Path(os.getcwd()) / ".sessions"
-    restored_history, restored_from = load_latest_parent_history(sessions_dir)
+    resume_result = load_latest_parent_history(
+        sessions_dir,
+        max_messages=SESSION_RESUME_MAX_MESSAGES,
+        prefer_summary=True,
+    )
 
     session_id = f"session_{int(time.time() * 1000)}"
     session_logger = SessionLogger(
@@ -348,10 +353,13 @@ def main() -> None:
         hook_manager=hook_manager,
     )
 
-    history: list[ConversationMessage] = list(restored_history)
-    if restored_from is not None and history:
+    history: list[ConversationMessage] = list(resume_result.history)
+    if resume_result.path is not None and history:
         print(
-            f"[session_resume] 已从 {restored_from.name} 恢复主历史，共 {len(history)} 条消息。"
+            "[session_resume] "
+            f"已从 {resume_result.path.name} 恢复主历史，"
+            f"模式={resume_result.mode}，"
+            f"共 {len(history)} 条消息。"
         )
 
     while True:

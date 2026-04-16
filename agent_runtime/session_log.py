@@ -1,14 +1,4 @@
-"""最小会话追加日志。
-
-这一层只做一件事：
-- 每当新的 ConversationMessage 进入会话历史，就把它追加写入 `.sessions/<session_id>.jsonl`
-
-当前不实现：
-- 恢复会话
-- 索引
-- 数据库
-- 搜索
-"""
+"""最小会话追加日志与主会话恢复。"""
 
 from __future__ import annotations
 
@@ -19,6 +9,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .types import ConversationMessage, ToolCall
+
+
+SUMMARY_MESSAGE_PREFIX = "[上下文压缩摘要]"
 
 
 @dataclass(slots=True)
@@ -59,17 +52,32 @@ class SessionLogger:
                 file.write(line + "\n")
 
 
-def load_latest_parent_history(session_dir: Path) -> tuple[list[ConversationMessage], Path | None]:
+@dataclass(slots=True)
+class SessionResumeResult:
+    """主 Agent 会话恢复结果。"""
+
+    history: list[ConversationMessage]
+    path: Path | None
+    mode: str = "empty"
+
+
+def load_latest_parent_history(
+    session_dir: Path,
+    *,
+    max_messages: int = 40,
+    prefer_summary: bool = True,
+) -> SessionResumeResult:
     """从最近一次 session log 恢复主 Agent 的历史。
 
-    这是“最小持久记忆恢复”：
+    恢复策略：
     - 只读取 `.sessions/` 下最近修改的一个 jsonl
     - 只恢复 `scope=parent` 的消息
-    - 把日志重新还原成 ConversationMessage 列表
+    - 默认只恢复最近窗口，而不是整段历史
+    - 如果存在最近一次 compact 摘要，优先保留“摘要 + 最近消息”
     """
 
     if not session_dir.exists():
-        return [], None
+        return SessionResumeResult(history=[], path=None, mode="empty")
 
     candidates = sorted(
         session_dir.glob("session_*.jsonl"),
@@ -77,10 +85,10 @@ def load_latest_parent_history(session_dir: Path) -> tuple[list[ConversationMess
         reverse=True,
     )
     if not candidates:
-        return [], None
+        return SessionResumeResult(history=[], path=None, mode="empty")
 
     latest_path = candidates[0]
-    history: list[ConversationMessage] = []
+    full_history: list[ConversationMessage] = []
 
     for raw_line in latest_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
@@ -104,7 +112,7 @@ def load_latest_parent_history(session_dir: Path) -> tuple[list[ConversationMess
             for item in payload.get("tool_calls", [])  # type: ignore[arg-type]
         ]
 
-        history.append(
+        full_history.append(
             ConversationMessage(
                 role=str(payload.get("role", "user")),  # type: ignore[arg-type]
                 content=str(payload.get("content", "")),
@@ -118,4 +126,40 @@ def load_latest_parent_history(session_dir: Path) -> tuple[list[ConversationMess
             )
         )
 
-    return history, latest_path
+    if not full_history:
+        return SessionResumeResult(history=[], path=latest_path, mode="empty")
+
+    max_messages = max(1, max_messages)
+
+    if prefer_summary:
+        summary_index = _find_last_summary_index(full_history)
+        if summary_index is not None:
+            summary_message = full_history[summary_index]
+            tail_messages = full_history[summary_index + 1 :]
+
+            restored = [summary_message]
+            restored.extend(tail_messages[-(max_messages - 1) :])
+            return SessionResumeResult(
+                history=restored,
+                path=latest_path,
+                mode="summary_plus_recent",
+            )
+
+    return SessionResumeResult(
+        history=full_history[-max_messages:],
+        path=latest_path,
+        mode="recent_window",
+    )
+
+
+def _find_last_summary_index(messages: list[ConversationMessage]) -> int | None:
+    """查找最近一次 compact 摘要消息的位置。"""
+
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if (
+            message.role == "assistant"
+            and message.content.startswith(SUMMARY_MESSAGE_PREFIX)
+        ):
+            return index
+    return None
