@@ -558,6 +558,7 @@ class TeamAgentRunner:
     llm_client_factory: Callable[[], BaseLLMClient]
     tool_registry_factory: Callable[[str], ToolRegistry]
     base_system_prompt_builder: Callable[[str], str]
+    startup_messages: list[ConversationMessage] | None = None
     max_steps: int = 8
     compactor: ConversationCompactor | None = None
 
@@ -584,6 +585,14 @@ class TeamAgentRunner:
         # "No tool call found for function call output"。
         history = self._sanitize_history_for_tools(history)
         session_logger = self.team_manager.build_session_logger(agent_id)
+
+        # 把启动上下文作为持久 history 的前置消息注入一次，避免每轮重复追加。
+        self._ensure_startup_messages(
+            history=history,
+            startup_messages=self.startup_messages or [],
+            session_logger=session_logger,
+            scope=f"team:{agent_id}:startup",
+        )
 
         for inbound in inbox_messages:
             user_message = ConversationMessage(
@@ -656,6 +665,27 @@ class TeamAgentRunner:
             f"运行状态：{run_result.status}\n"
             f"结果摘要：\n{run_result.final_text}"
         )
+
+    @staticmethod
+    def _ensure_startup_messages(
+        *,
+        history: list[ConversationMessage],
+        startup_messages: list[ConversationMessage],
+        session_logger: SessionLogger,
+        scope: str,
+    ) -> None:
+        """确保启动上下文只注入一次。"""
+
+        existing = {(item.role, item.content) for item in history}
+        for message in startup_messages:
+            key = (message.role, message.content)
+            if key in existing:
+                continue
+
+            copied = ConversationMessage(role=message.role, content=message.content)
+            history.append(copied)
+            session_logger.append_message(copied, scope=scope)
+            existing.add(key)
 
     @staticmethod
     def _sanitize_history_for_tools(

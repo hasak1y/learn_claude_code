@@ -48,6 +48,8 @@ agent_runtime/
   background_jobs.py
   compaction.py
   config.py
+  dialogue_history.py
+  memory.py
   session_log.py
   skills.py
   subagents.py
@@ -74,6 +76,12 @@ skills/
     SKILL.md
   test/
     SKILL.md
+.memory/
+  MEMORY.md
+  topics/
+.chat_history/
+  recent_dialogue.jsonl
+learnclaude.md
 ```
 
 ## 环境变量
@@ -89,6 +97,11 @@ skills/
 - `LLM_TIMEOUT_SECONDS`，默认值为 `120`
 - `LLM_MAX_TOKENS`，默认值为 `2000`
 - `LLM_TEMPERATURE`，默认值为 `0`
+- `LLM_CONTEXT_WINDOW`，默认值为 `16000`
+- `SESSION_RESUME_MAX_MESSAGES`，默认值为 `40`
+- `RECENT_DIALOGUE_MAX_MESSAGES`，默认值为 `100`
+- `MEMORY_DIALOGUE_LOOKBACK`，默认值为 `24`
+- `LEARNCLAUDE_MANAGED_PATH`，可选，指向组织级 `learnclaude.md`
 
 你也可以在项目根目录放一个本地 `.env` 文件，写入同名配置项。
 
@@ -98,7 +111,300 @@ skills/
 LLM_MODEL=gpt-4o-mini
 LLM_API_KEY=your_api_key_here
 LLM_BASE_URL=https://api.openai.com/v1
+LLM_CONTEXT_WINDOW=16000
 ```
+
+## 四层记忆系统
+
+当前版本已经把“外置上下文”和“模型学会了”明确分开。
+
+这里的 `learnclaude.md`、`MEMORY.md` 和 topic files 都属于运行时注入或按需加载的外置上下文，
+不是模型参数层面的学习。
+
+### 第 1 层：长期规则层
+
+规则文件统一使用 `learnclaude.md` / `learnclaude.local.md`，不再使用 `CLAUDE.md` 命名。
+
+当前支持的来源：
+
+- managed policy：通过 `LEARNCLAUDE_MANAGED_PATH` 指向组织级规则文件
+- user：`~/.learnclaude/learnclaude.md`
+- project shared：项目树中的 `learnclaude.md`
+- project local：项目树中的 `learnclaude.local.md`
+
+加载顺序：
+
+1. managed
+2. user
+3. 从当前工作目录一路向上找到的 project `learnclaude.md`
+4. 同目录下对应的 `learnclaude.local.md`
+
+规则是“拼接而不是覆盖”：
+
+- 上层目录规则先出现
+- 下层目录规则后出现
+- 同目录里 `learnclaude.local.md` 追加在 `learnclaude.md` 后面
+
+代码位置：
+
+- [agent_runtime/memory.py](E:\github\learn_claude_code\agent_runtime\memory.py) 中的 `LearnClaudeContextLoader`
+- [main.py](E:\github\learn_claude_code\main.py) 中 `build_startup_context_messages(...)`
+
+运行方式：
+
+- 启动时统一收集长期规则层
+- 不再直接拼进 system prompt，而是作为“system prompt 之后的启动上下文消息”注入
+- parent / subagent / teammate 都会收到这层启动上下文
+- 这是原始文本注入，不做结构化解析，不做硬约束执行
+
+### 第 2 层：长期经验层
+
+当前长期经验放在：
+
+```text
+.memory/
+  MEMORY.md
+  topics/
+    *.md
+```
+
+设计原则：
+
+- `MEMORY.md` 只做索引，不直接保存完整经验正文
+- 具体经验正文放在 `topics/*.md`
+- 一条长期经验至少包含：
+  - `name`
+  - `description`
+  - `type`
+  - `path`
+
+当前 `MEMORY.md` 的索引格式是单行结构：
+
+```text
+- path: topics/debugging.md | name: Debugging Notes | type: reference | description: 常见调试路径与注意事项
+```
+
+`topics/*.md` 的正文格式是：
+
+```md
+---
+name: Debugging Notes
+description: 常见调试路径与注意事项
+type: reference
+---
+
+这里写详细经验内容。
+```
+
+当前支持的 `type` 语义：
+
+- `user`
+- `project`
+- `feedback`
+- `reference`
+
+代码位置：
+
+- [agent_runtime/memory.py](E:\github\learn_claude_code\agent_runtime\memory.py) 中的 `AutoMemoryManager`
+
+### 第 3 层：按需加载层
+
+这一层分成两类。
+
+#### 3.1 长期经验按需检索
+
+这是基于“合理推断”实现的本地版本，不声称等同于任何官方私有细节。
+
+当前流程：
+
+1. 启动时先把 `MEMORY.md` 的前置切片作为启动上下文消息注入
+2. 每轮用户请求前，再读取 `MEMORY.md` 索引摘要
+3. 把“用户当前请求 + 索引摘要”发送给一个单独的检索调用
+4. 检索调用只返回少量最相关的 topic 路径 JSON
+5. 默认最多取 5 个 topic
+6. 读取这些 topic 正文，并作为 request-only memory 注入本轮上下文
+
+当前实现细节：
+
+- 入口 hook：`before_llm_request`
+- 只在最后一条消息是 `user` 时触发
+- 如果 LLM 检索失败，会退回关键词重叠的简单检索
+- 为了避免引入第二套模型配置，当前检索调用复用了主 `llm_client`
+
+代码位置：
+
+- [agent_runtime/runtime_hooks.py](E:\github\learn_claude_code\agent_runtime\runtime_hooks.py) 中的 `MemoryRetrievalHook`
+- [agent_runtime/memory.py](E:\github\learn_claude_code\agent_runtime\memory.py) 中的 `retrieve_for_query(...)`
+
+#### 3.2 path-scoped 规则按访问路径激活
+
+子目录规则不是启动时全量注入，而是在真的访问对应路径后才激活。
+
+当前流程：
+
+1. 用户通过 `read_file` / `write_file` / `edit_file` 访问某个文件
+2. runtime 判断这个文件是否位于当前工作目录下的更深层子目录
+3. 如果该路径沿途存在子目录 `learnclaude.md` / `learnclaude.local.md`
+4. 就把这些规则作为追加消息注入活跃历史
+5. 同一目录在同一进程里只激活一次，避免重复污染上下文
+
+代码位置：
+
+- [agent_runtime/runtime_hooks.py](E:\github\learn_claude_code\agent_runtime\runtime_hooks.py) 中的 `PathScopedRuleHook`
+- [agent_runtime/memory.py](E:\github\learn_claude_code\agent_runtime\memory.py) 中的 `render_path_scoped_for_target(...)`
+
+### 第 4 层：执行控制层
+
+这层和记忆有关，但不等于记忆。
+
+当前仍然独立于记忆系统：
+
+- settings / env 配置
+- hook 系统
+- permission policy
+- model / context window 配置
+
+也就是说：
+
+- `learnclaude.md` 是上下文
+- `MEMORY.md` 是长期经验索引
+- `permissions` / `hooks` / `config` 是执行控制
+
+不要把它们混成同一层。
+
+## 会话记忆与聊天记录
+
+### 会话恢复
+
+主 Agent 的会话恢复仍然基于：
+
+```text
+.sessions/<session_id>.jsonl
+```
+
+当前恢复策略：
+
+- 只恢复最近一个主会话
+- 默认恢复最近窗口
+- 如果最近一次会话里已经存在 `[上下文压缩摘要]`
+  则优先走 `summary_plus_recent`
+
+配置项：
+
+```env
+SESSION_RESUME_MAX_MESSAGES=40
+```
+
+代码位置：
+
+- [agent_runtime/session_log.py](E:\github\learn_claude_code\agent_runtime\session_log.py)
+
+### 最近原始聊天记录
+
+除了 `.sessions/` 之外，当前还额外维护最近未压缩的原始对话：
+
+```text
+.chat_history/recent_dialogue.jsonl
+```
+
+设计目的：
+
+- 只保留最近 `user / assistant` 文本
+- 不记录工具消息
+- 不参与主会话恢复
+- 专门供跨会话自动记忆提取使用
+
+默认配置：
+
+```env
+RECENT_DIALOGUE_MAX_MESSAGES=100
+```
+
+代码位置：
+
+- [agent_runtime/dialogue_history.py](E:\github\learn_claude_code\agent_runtime\dialogue_history.py)
+
+## 自动记忆写入
+
+跨会话自动记忆当前已经接入，但采用的是“索引摘要 + 最近对话”的增量提取方式，
+而不是每轮全量浏览所有原始记忆。
+
+当前流程：
+
+1. 每轮主回复结束后，把本轮 `user / assistant` 原始文本写入 `.chat_history/recent_dialogue.jsonl`
+2. 读取最近 `N` 条原始对话，默认 `24`
+3. 把“现有长期经验索引摘要 + 最近对话”发送给一个记忆提取调用
+4. 提取器决定：
+   - `ignore`
+   - `upsert`
+5. runtime 在真正写入前先做 normalize
+6. runtime 尝试把新候选合并进已有 topic，而不是盲目创建新文件
+7. 最多一次写入 2 条长期经验
+8. 写 topic 文件并重建 `MEMORY.md`
+
+默认配置：
+
+```env
+MEMORY_DIALOGUE_LOOKBACK=24
+```
+
+当前提取目标：
+
+- 稳定的用户偏好
+- 项目级约定
+- 用户纠正过的反馈项
+- 具有复用价值的经验总结
+
+### 自动记忆 normalize 与 merge
+
+为了避免同义偏好被写成多个 topic，当前自动记忆在写入前会先做一层归一化。
+
+当前 normalize 规则：
+
+- `type` 只允许落到 `user / project / feedback / reference`
+- `name` 会尽量收敛到稳定主题名
+- `description` 会压成适合索引检索的单行摘要
+- `path` 会尽量映射到稳定文件路径，而不是每次新建随机名字
+
+当前内置了一些稳定主题映射，例如：
+
+- 回答风格 / 先给结论 / response style
+  统一归到 `User Response Style`
+- hook / 横切 / 主循环边界
+  统一归到 `Hook Boundary`
+- memory / 记忆分层 / 记忆系统设计
+  统一归到 `Memory Layer Design`
+
+当前 merge 规则：
+
+1. 如果新候选和已有 topic 路径相同，直接合并
+2. 如果 `type` 相同且 `name` 相同，优先合并
+3. 如果 `type` 相同且主题 token overlap 足够高，也会合并
+
+正文合并策略：
+
+- 如果新内容已经被旧正文包含，则不重复追加
+- 如果旧正文已经完全包含在新正文里，则直接采用新正文
+- 其他情况会在旧正文后追加一个 `## 增量补充` 小节
+
+这样做的目标不是“改写用户语义”，而是：
+
+- 降低长期经验分裂
+- 保持 topic 名称和路径稳定
+- 提升索引检索命中率
+- 让自动记忆更像增量维护，而不是无限长新文件
+
+当前刻意不做：
+
+- 每轮全量扫描所有 topic 正文
+- 无限增长的单文件 memory
+- 模型自行决定恢复多少原始 session 日志
+- 不受约束的长期记忆写入
+
+代码位置：
+
+- [main.py](E:\github\learn_claude_code\main.py) 中 `maybe_update_from_dialogue(...)` 的调用
+- [agent_runtime/memory.py](E:\github\learn_claude_code\agent_runtime\memory.py) 中的 `maybe_update_from_dialogue(...)`
 
 ## 运行方式
 

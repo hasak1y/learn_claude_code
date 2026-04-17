@@ -12,9 +12,16 @@ from agent_runtime.agent import AgentLoop
 from agent_runtime.background_jobs import BackgroundJobManager
 from agent_runtime.compaction import ConversationCompactor
 from agent_runtime.config import load_openai_compatible_config
+from agent_runtime.dialogue_history import RecentDialogueStore
 from agent_runtime.hooks import HookManager
 from agent_runtime.llm import OpenAICompatibleLLMClient
-from agent_runtime.runtime_hooks import BackgroundJobHook, PermissionHook
+from agent_runtime.memory import AutoMemoryManager, LearnClaudeContextLoader
+from agent_runtime.runtime_hooks import (
+    BackgroundJobHook,
+    MemoryRetrievalHook,
+    PathScopedRuleHook,
+    PermissionHook,
+)
 from agent_runtime.session_log import SessionLogger, load_latest_parent_history
 from agent_runtime.skills import SkillRegistry
 from agent_runtime.subagents import SubagentRunner
@@ -60,6 +67,8 @@ from agent_runtime.types import ConversationMessage
 PROMPT_TEXT = "\033[36magent >> \033[0m"
 APPROVAL_TIMEOUT_SECONDS = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "30"))
 SESSION_RESUME_MAX_MESSAGES = int(os.getenv("SESSION_RESUME_MAX_MESSAGES", "40"))
+RECENT_DIALOGUE_MAX_MESSAGES = int(os.getenv("RECENT_DIALOGUE_MAX_MESSAGES", "100"))
+MEMORY_DIALOGUE_LOOKBACK = int(os.getenv("MEMORY_DIALOGUE_LOOKBACK", "24"))
 
 
 def _input_with_timeout(prompt: str, timeout_seconds: int) -> str | None:
@@ -114,10 +123,12 @@ def _prompt_user_approval(tool_call: object, decision: object) -> bool:
     return answer.strip().lower() in {"y", "yes"}
 
 
-def build_system_prompt(skill_registry: SkillRegistry) -> str:
+def build_system_prompt(
+    skill_registry: SkillRegistry,
+) -> str:
     """构造父 Agent 的系统提示词。"""
 
-    return (
+    base_prompt = (
         f"你是一个在 {os.getcwd()} 中运行的编程 Agent。\n"
         "需要时使用工具，直接行动，回答保持简洁，任务完成后立刻停止。\n"
         "当前提供的是通用 shell 工具，不要假设一定是 Unix bash 环境。\n"
@@ -133,26 +144,27 @@ def build_system_prompt(skill_registry: SkillRegistry) -> str:
         "task 会同步调用一个 fresh context 的子代理，父 Agent 会等待子代理返回最终文本。\n"
         "当你需要创建可跨多轮存活、拥有固定身份和独立历史的 teammate 时，使用 team_spawn_agent。\n"
         "当你需要把任务、备注或结果发给 teammate 时，使用 team_send_message。\n"
-        "当你需要让某个 teammate 处理它自己的 inbox 时，使用 team_run_agent。\n"
-        "team_list_agents、team_get_agent 和 team_peek_inbox 用来查看 team roster、生命周期状态和待处理消息。\n"
-        "team_shutdown_agent 用来结束某个 teammate 的生命周期。\n"
-        "teammate 和一次性 fresh-context 的 task 子代理不同：前者有持久历史和身份，后者只做单次委派。\n"
         "当前开启了权限审查：敏感操作需要用户确认。\n"
+        "长期规则层和长期经验层会通过后续上下文消息注入，而不是直接写死在 system prompt 中。\n"
+        "这些都属于外置上下文，不代表模型权重已经学会了它们。\n"
         "当上下文很长、阶段切换或工具结果累积较多时，可以使用 compact。\n"
-        "如果用户明确要求执行 compact，那么在收集到完成该轮总结所需的最小信息后，应尽快调用 compact，不要继续进行无关或重复的搜索。\n"
+        "如果用户明确要求执行 compact，那么在收集到完成该轮总结所需的最少信息后，应尽快调用 compact。\n"
         "只有在文件类工具不适合时，再退回使用 shell。\n\n"
         "权限审查规则：\n"
         "- shell 非白名单命令需要用户确认。\n"
-        "- read_only 模式下 write_file / edit_file 会被拒绝。\n"
-        "- dev_safe 模式下 shell_background 仅白名单直接放行，其余需要确认。\n\n"
-        f"{skill_registry.build_prompt_index()}"
+        "- read_only 模式中 write_file / edit_file 会被拒绝。\n"
+        "- dev_safe 模式中 shell_background 仅白名单直接放行，其余需要确认。\n"
     )
 
+    return f"{base_prompt}\n{skill_registry.build_prompt_index()}"
 
-def build_subagent_system_prompt(skill_registry: SkillRegistry) -> str:
+
+def build_subagent_system_prompt(
+    skill_registry: SkillRegistry,
+) -> str:
     """构造一次性子代理使用的系统提示词。"""
 
-    return (
+    base_prompt = (
         f"你是一个在 {os.getcwd()} 中运行的子代理。\n"
         "你拥有 fresh context，只负责当前被委派的单个子任务。\n"
         "你没有 task 工具，也没有 task graph 工具，不能继续创建新的子代理或改动父任务图。\n"
@@ -161,27 +173,92 @@ def build_subagent_system_prompt(skill_registry: SkillRegistry) -> str:
         "创建或整体覆盖文本文件时优先使用 write_file。\n"
         "修改已有文件时优先使用 edit_file。\n"
         "必要时可以使用 compact 来收缩上下文。\n"
-        "如果当前任务已经明确要求 compact，在拿到必要信息后应尽快执行，不要继续无关搜索。\n"
-        "只有在文件类工具不适合时，再退回使用 shell。\n\n"
-        f"{skill_registry.build_prompt_index()}"
+        "只有在文件类工具不适合时，再退回使用 shell。\n"
     )
 
+    return f"{base_prompt}\n{skill_registry.build_prompt_index()}"
 
-def build_team_agent_base_prompt(skill_registry: SkillRegistry) -> str:
+
+def build_team_agent_base_prompt(
+    skill_registry: SkillRegistry,
+) -> str:
     """构造持久 teammate 的通用基础提示词。"""
 
-    return (
+    base_prompt = (
         f"你是一个在 {os.getcwd()} 中运行的持久 teammate。\n"
         "你会跨多轮处理自己的 inbox 任务，并保留自己的历史。\n"
         "需要时使用工具，回答保持简洁。\n"
-        "如果需要把结论、阻塞或协作请求发送给其他 teammate，请使用 team_send_message。\n"
+        "如果需要把结论、阻塞或协作请求发给其他 teammate，请使用 team_send_message。\n"
         "读取文件时优先使用 read_file。\n"
         "创建或整体覆盖文本文件时优先使用 write_file。\n"
         "修改已有文件时优先使用 edit_file。\n"
         "必要时可以使用 compact 来收缩上下文。\n"
-        "只有在文件类工具不适合时，再退回使用 shell。\n\n"
-        f"{skill_registry.build_prompt_index()}"
+        "只有在文件类工具不适合时，再退回使用 shell。\n"
     )
+
+    return f"{base_prompt}\n{skill_registry.build_prompt_index()}"
+
+
+def build_startup_context_messages(
+    *,
+    learnclaude_text: str,
+    memory_index_slice: str,
+) -> list[ConversationMessage]:
+    """构造“system prompt 之后”的启动上下文消息。
+
+    这里专门放长期规则层和长期经验层的启动切片，
+    避免把它们和 core system prompt 混成一坨。
+    """
+
+    messages: list[ConversationMessage] = []
+    if learnclaude_text:
+        messages.append(
+            ConversationMessage(
+                role="user",
+                content=(
+                    "<startup_context type=\"learnclaude\">\n"
+                    "以下是运行时加载的长期规则层，请把它视为外置上下文，而不是模型已经学会的知识。\n\n"
+                    f"{learnclaude_text}\n"
+                    "</startup_context>"
+                ),
+            )
+        )
+
+    if memory_index_slice:
+        messages.append(
+            ConversationMessage(
+                role="user",
+                content=(
+                    "<startup_context type=\"memory_index\">\n"
+                    "以下是长期经验索引的启动切片。它只说明有哪些长期经验主题存在，不代表这些主题正文已经全部加载。\n\n"
+                    f"{memory_index_slice}\n"
+                    "</startup_context>"
+                ),
+            )
+        )
+
+    return messages
+
+
+def ensure_startup_context_messages(
+    *,
+    history: list[ConversationMessage],
+    startup_messages: list[ConversationMessage],
+    session_logger: SessionLogger,
+    scope: str,
+) -> None:
+    """确保启动上下文只注入一次。"""
+
+    existing = {(item.role, item.content) for item in history}
+    for message in startup_messages:
+        key = (message.role, message.content)
+        if key in existing:
+            continue
+
+        copied = ConversationMessage(role=message.role, content=message.content)
+        history.append(copied)
+        session_logger.append_message(copied, scope=scope)
+        existing.add(key)
 
 
 def build_child_tool_registry(skill_registry: SkillRegistry) -> ToolRegistry:
@@ -274,22 +351,46 @@ def main() -> None:
         missing_key = exc.args[0]
         print(f"缺少必填环境变量：{missing_key}")
         print("必填变量：LLM_MODEL, LLM_API_KEY")
-        print("可选变量：LLM_BASE_URL, LLM_TIMEOUT_SECONDS, LLM_MAX_TOKENS, LLM_TEMPERATURE")
+        print(
+            "可选变量：LLM_BASE_URL, LLM_TIMEOUT_SECONDS, LLM_MAX_TOKENS, "
+            "LLM_TEMPERATURE, LLM_CONTEXT_WINDOW"
+        )
         return
+
+    cwd = Path(os.getcwd())
+    managed_rules_path_raw = os.getenv("LEARNCLAUDE_MANAGED_PATH", "").strip()
+    managed_rules_path = Path(managed_rules_path_raw) if managed_rules_path_raw else None
 
     llm_client = OpenAICompatibleLLMClient(config)
     permission_mode = os.getenv("PERMISSION_MODE", "dev_safe")
     permission_policy = PermissionPolicy(mode=permission_mode)  # type: ignore[arg-type]
-    skill_registry = SkillRegistry(root=os.path.join(os.getcwd(), "skills"))
+    skill_registry = SkillRegistry(root=str(cwd / "skills"))
     todo_manager = TodoManager(reminder_threshold=3)
-    task_graph_manager = TaskGraphManager(tasks_dir=Path(os.getcwd()) / ".tasks")
+    task_graph_manager = TaskGraphManager(tasks_dir=cwd / ".tasks")
     background_job_manager = BackgroundJobManager(cwd=os.getcwd())
-    team_manager = TeamManager(root=Path(os.getcwd()) / ".team")
-    sessions_dir = Path(os.getcwd()) / ".sessions"
+    team_manager = TeamManager(root=cwd / ".team")
+    sessions_dir = cwd / ".sessions"
     resume_result = load_latest_parent_history(
         sessions_dir,
         max_messages=SESSION_RESUME_MAX_MESSAGES,
         prefer_summary=True,
+    )
+
+    # 长期规则层：启动时统一读取 learnclaude 规则，直接拼进系统提示词。
+    learnclaude_loader = LearnClaudeContextLoader(
+        cwd=cwd,
+        managed_path=managed_rules_path,
+    )
+    learnclaude_text = learnclaude_loader.render_for_system_prompt()
+
+    # 长期经验层：MEMORY.md + topic files。
+    memory_manager = AutoMemoryManager(root=cwd / ".memory")
+    memory_index_slice = memory_manager.render_startup_index_slice()
+
+    # 原始最近对话层：只保留 user / assistant，不参与会话恢复。
+    recent_dialogue_store = RecentDialogueStore(
+        path=cwd / ".chat_history" / "recent_dialogue.jsonl",
+        max_messages=RECENT_DIALOGUE_MAX_MESSAGES,
     )
 
     session_id = f"session_{int(time.time() * 1000)}"
@@ -297,18 +398,27 @@ def main() -> None:
         session_id=session_id,
         path=sessions_dir / f"{session_id}.jsonl",
     )
+
+    # 接近上下文窗口 85% 时自动 compact。
+    auto_compact_threshold = max(1, int(config.context_window * 0.85))
     compactor = ConversationCompactor(
-        transcript_dir=Path(os.getcwd()) / ".transcripts",
-        auto_compact_token_threshold=12000,
+        transcript_dir=cwd / ".transcripts",
+        auto_compact_token_threshold=auto_compact_threshold,
     )
+
     subagent_runner = SubagentRunner(
         llm_client_factory=lambda: OpenAICompatibleLLMClient(config),
         child_tool_registry_factory=lambda: build_child_tool_registry(skill_registry),
         child_system_prompt=build_subagent_system_prompt(skill_registry),
+        child_startup_messages=build_startup_context_messages(
+            learnclaude_text=learnclaude_text,
+            memory_index_slice=memory_index_slice,
+        ),
         child_max_steps=12,
         compactor=compactor,
         session_logger=session_logger,
     )
+
     team_runner = TeamAgentRunner(
         team_manager=team_manager,
         llm_client_factory=lambda: OpenAICompatibleLLMClient(config),
@@ -318,9 +428,14 @@ def main() -> None:
             sender_id=agent_id,
         ),
         base_system_prompt_builder=lambda _agent_id: build_team_agent_base_prompt(skill_registry),
+        startup_messages=build_startup_context_messages(
+            learnclaude_text=learnclaude_text,
+            memory_index_slice=memory_index_slice,
+        ),
         max_steps=12,
         compactor=compactor,
     )
+
     tool_registry = build_parent_tool_registry(
         todo_manager=todo_manager,
         subagent_runner=subagent_runner,
@@ -330,14 +445,22 @@ def main() -> None:
         team_manager=team_manager,
         team_runner=team_runner,
     )
+
     hook_manager = HookManager(
         {
-            "before_llm_request": [BackgroundJobHook(background_job_manager)],
+            "before_llm_request": [
+                BackgroundJobHook(background_job_manager),
+                MemoryRetrievalHook(memory_manager, llm_client),
+            ],
             "before_tool_execute": [
                 PermissionHook(permission_policy, _prompt_user_approval)
             ],
+            "after_tool_execute": [
+                PathScopedRuleHook(learnclaude_loader, cwd)
+            ],
         }
     )
+
     agent = AgentLoop(
         llm_client=llm_client,
         tool_registry=tool_registry,
@@ -354,6 +477,16 @@ def main() -> None:
     )
 
     history: list[ConversationMessage] = list(resume_result.history)
+    startup_context_messages = build_startup_context_messages(
+        learnclaude_text=learnclaude_text,
+        memory_index_slice=memory_index_slice,
+    )
+    ensure_startup_context_messages(
+        history=history,
+        startup_messages=startup_context_messages,
+        session_logger=session_logger,
+        scope="parent:startup",
+    )
     if resume_result.path is not None and history:
         print(
             "[session_resume] "
@@ -361,11 +494,16 @@ def main() -> None:
             f"模式={resume_result.mode}，"
             f"共 {len(history)} 条消息。"
         )
+    if learnclaude_text:
+        print("[learnclaude] 已加载长期规则层。")
+    print(
+        "[memory] "
+        f"自动 compact 阈值={auto_compact_threshold}，"
+        "长期经验将按需检索。"
+    )
 
     while True:
         try:
-            # 显式输出提示符，再读取裸 input，可以避开某些终端环境下
-            # `input(prompt)` 配合 ANSI 颜色时出现重复渲染提示符的问题。
             sys.stdout.write(PROMPT_TEXT)
             sys.stdout.flush()
             user_input = input().strip()
@@ -391,8 +529,28 @@ def main() -> None:
             print()
             continue
 
+        # 最近原始对话单独落盘，供跨会话自动记忆提取使用。
+        recent_dialogue_store.append_message(
+            role="user",
+            content=user_input,
+            session_id=session_id,
+        )
+
         if run_result.final_text:
+            recent_dialogue_store.append_message(
+                role="assistant",
+                content=run_result.final_text,
+                session_id=session_id,
+            )
             print(run_result.final_text)
+
+        auto_memory_message = memory_manager.maybe_update_from_dialogue(
+            llm_client=llm_client,
+            recent_dialogue=recent_dialogue_store.load_recent(MEMORY_DIALOGUE_LOOKBACK),
+        )
+        if auto_memory_message:
+            print(f"[auto_memory] {auto_memory_message}")
+
         print()
 
 

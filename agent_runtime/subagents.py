@@ -20,6 +20,7 @@ class SubagentRunner:
     llm_client_factory: Callable[[], BaseLLMClient]
     child_tool_registry_factory: Callable[[], ToolRegistry]
     child_system_prompt: str
+    child_startup_messages: list[ConversationMessage] | None = None
     child_max_steps: int = 12
     compactor: ConversationCompactor | None = None
     session_logger: SessionLogger | None = None
@@ -29,9 +30,19 @@ class SubagentRunner:
 
         llm_client = self.llm_client_factory()
         tool_registry = self.child_tool_registry_factory()
-        sub_messages = [ConversationMessage(role="user", content=prompt)]
+        sub_messages: list[ConversationMessage] = []
+
+        # 启动上下文作为“系统提示之后的上下文消息”注入，而不是拼进 system prompt。
+        for message in self.child_startup_messages or []:
+            copied = ConversationMessage(role=message.role, content=message.content)
+            sub_messages.append(copied)
+            if self.session_logger is not None:
+                self.session_logger.append_message(copied, scope="subagent")
+
+        user_message = ConversationMessage(role="user", content=prompt)
+        sub_messages.append(user_message)
         if self.session_logger is not None:
-            self.session_logger.append_message(sub_messages[0], scope="subagent")
+            self.session_logger.append_message(user_message, scope="subagent")
 
         return AgentLoop(
             llm_client=llm_client,

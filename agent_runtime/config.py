@@ -1,12 +1,9 @@
 """配置相关辅助函数。
 
-这个模块会故意保持轻量：
-- 读取一个可选的本地 `.env`
-- 读取少量必要环境变量
-- 组装 LLM 适配器使用的配置对象
-
-第一版先不为了加载配置额外引入依赖，
-用一个很小的本地加载器就足够了。
+这里保持轻量，只负责：
+- 读取本地 `.env`
+- 从环境变量组装 LLM 配置
+- 暴露少量和 runtime 记忆系统相关的配置项
 """
 
 from __future__ import annotations
@@ -26,19 +23,11 @@ class OpenAICompatibleConfig:
     timeout_seconds: int = 120
     max_tokens: int = 2000
     temperature: float = 0.0
+    context_window: int = 16000
 
 
 def load_dotenv_if_present(dotenv_path: str = ".env") -> None:
-    """如果本地存在 `.env`，就读取其中简单的 `KEY=VALUE` 配置。
-
-    这个加载器会故意保持克制：
-    - 文件不存在时直接跳过
-    - 已有环境变量优先，不会被覆盖
-    - 注释和空行会被忽略
-
-    对第一版本地开发来说，这样已经够用，
-    不需要为此额外引入新的库。
-    """
+    """如果存在 `.env`，就读取其中简单的 `KEY=VALUE` 配置。"""
 
     path = Path(dotenv_path)
     if not path.exists():
@@ -58,18 +47,7 @@ def load_dotenv_if_present(dotenv_path: str = ".env") -> None:
 
 
 def load_openai_compatible_config() -> OpenAICompatibleConfig:
-    """从环境变量构造 OpenAI-compatible 配置。
-
-    必填项：
-    - `LLM_MODEL`
-    - `LLM_API_KEY`
-
-    可选项：
-    - `LLM_BASE_URL`
-    - `LLM_TIMEOUT_SECONDS`
-    - `LLM_MAX_TOKENS`
-    - `LLM_TEMPERATURE`
-    """
+    """从环境变量构造 OpenAI-compatible 配置。"""
 
     load_dotenv_if_present()
 
@@ -79,6 +57,7 @@ def load_openai_compatible_config() -> OpenAICompatibleConfig:
     timeout_seconds = int(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
     max_tokens = int(os.getenv("LLM_MAX_TOKENS", "2000"))
     temperature = float(os.getenv("LLM_TEMPERATURE", "0"))
+    context_window = int(os.getenv("LLM_CONTEXT_WINDOW", "16000"))
 
     return OpenAICompatibleConfig(
         model=model,
@@ -87,4 +66,5 @@ def load_openai_compatible_config() -> OpenAICompatibleConfig:
         timeout_seconds=timeout_seconds,
         max_tokens=max_tokens,
         temperature=temperature,
+        context_window=context_window,
     )
