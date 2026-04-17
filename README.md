@@ -50,6 +50,7 @@ agent_runtime/
   config.py
   dialogue_history.py
   memory.py
+  team.py
   session_log.py
   skills.py
   subagents.py
@@ -81,8 +82,140 @@ skills/
   topics/
 .chat_history/
   recent_dialogue.jsonl
+.team/
+  agents/
+  inbox/
+  requests/
+  history/
+  sessions/
+  config.json
 learnclaude.md
 ```
+
+## Team 协议层
+
+当前的 teammate 协作不再只有普通消息，还额外引入了一层最小 request/response 协议。
+
+### 两层通信模型
+
+1. 普通消息
+- 继续使用 `team_send_message`
+- 适合讨论、提醒、补充说明
+- 仍然走 `.team/inbox/*.jsonl`
+- 类型仍然是 `task / note / result`
+
+2. 协议消息
+- 使用 `team_send_protocol`
+- 适合审批、关机请求、交接、签收
+- 同样投递到 `.team/inbox/*.jsonl`
+- 但载体变成 `ProtocolEnvelope`
+- 每条协议消息都带 `request_id`
+
+### 请求追踪表
+
+每个协议请求都会在：
+
+```text
+.team/requests/<request_id>.json
+```
+
+里保留一份 `RequestRecord`。这层和 inbox 是分开的：
+
+- inbox 负责投递
+- request table 负责追踪状态
+
+也就是说，inbox 被 drain 以后，请求状态不会丢。
+
+### ProtocolEnvelope
+
+投递到 inbox 的结构化协议消息包含这些字段：
+
+- `request_id`
+- `envelope_type`
+- `action`
+- `from`
+- `to`
+- `summary`
+- `content`
+- `response_status`
+- `created_at`
+
+当前 `action` 枚举：
+
+- `approval_request`
+- `shutdown_request`
+- `handoff_request`
+- `ack_request`
+
+当前 `envelope_type` 枚举：
+
+- `request`
+- `response`
+
+### RequestRecord 状态机
+
+当前请求状态枚举：
+
+- `pending`
+- `acknowledged`
+- `approved`
+- `rejected`
+- `completed`
+- `cancelled`
+- `failed`
+
+最小状态迁移规则：
+
+- `pending -> acknowledged / approved / rejected / completed / cancelled / failed`
+- `acknowledged -> approved / rejected / completed / cancelled / failed`
+- `approved -> completed / failed / cancelled`
+- 其他状态视为终态
+
+### 运行流程
+
+协议请求的最小链路是：
+
+1. 发起方调用 `team_send_protocol`
+2. runtime 创建 `RequestRecord`
+3. runtime 把 `ProtocolEnvelope(request)` 追加到目标 Agent 的 inbox
+4. 目标 Agent 下一轮 `drain_inbox()`
+5. runtime 发现这是 protocol request，就自动把请求从 `pending` 更新为 `acknowledged`
+6. 同时把它包装成 `<protocol_request>...</protocol_request>` 注入 teammate 的上下文
+7. 如果对方决定批准、拒绝、完成或取消，就调用 `team_respond_protocol`
+8. runtime 更新 `RequestRecord`
+9. 如果响应方不是发起方，还会自动往发起方 inbox 投递一条 `ProtocolEnvelope(response)`
+10. 发起方后续可以查看 `.team/requests/*.json`，也可以通过 `team_get_request` / `team_list_requests` 读取状态
+
+### 普通消息与协议消息的边界
+
+当前边界建议：
+
+- 用 `team_send_message`
+  - 讨论
+  - 提醒
+  - 补充说明
+  - 一般性结果回传
+
+- 用 `team_send_protocol`
+  - 审批
+  - 关机请求
+  - 交接
+  - 需要签收或状态追踪的正式动作
+
+### 相关工具
+
+当前 team 相关工具分成两组：
+
+普通消息：
+- `team_send_message`
+- `team_peek_inbox`
+- `team_run_agent`
+
+协议层：
+- `team_send_protocol`
+- `team_respond_protocol`
+- `team_get_request`
+- `team_list_requests`
 
 ## 环境变量
 

@@ -38,6 +38,23 @@ from .types import AgentRunResult, ConversationMessage, ToolCall
 
 TeamAgentStatus = Literal["idle", "working", "shutdown"]
 TeamMessageType = Literal["task", "note", "result"]
+ProtocolAction = Literal[
+    "approval_request",
+    "shutdown_request",
+    "handoff_request",
+    "ack_request",
+]
+RequestStatus = Literal[
+    "pending",
+    "acknowledged",
+    "approved",
+    "rejected",
+    "completed",
+    "cancelled",
+    "failed",
+]
+InboxItemKind = Literal["message", "protocol"]
+ProtocolEnvelopeType = Literal["request", "response"]
 
 
 @dataclass(slots=True)
@@ -117,6 +134,138 @@ class TeamMessage:
         )
 
 
+@dataclass(slots=True)
+class ProtocolEnvelope:
+    """投递到 inbox 的结构化协议消息。"""
+
+    request_id: str
+    envelope_type: ProtocolEnvelopeType
+    action: ProtocolAction
+    sender: str
+    recipient: str
+    summary: str
+    content: str
+    response_status: RequestStatus | None
+    created_at: float
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "requestId": self.request_id,
+            "envelopeType": self.envelope_type,
+            "action": self.action,
+            "from": self.sender,
+            "to": self.recipient,
+            "summary": self.summary,
+            "content": self.content,
+            "responseStatus": self.response_status,
+            "createdAt": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "ProtocolEnvelope":
+        return cls(
+            request_id=str(data.get("requestId", "")),
+            envelope_type=str(data.get("envelopeType", "request")),  # type: ignore[arg-type]
+            action=str(data.get("action", "approval_request")),  # type: ignore[arg-type]
+            sender=str(data.get("from", "")),
+            recipient=str(data.get("to", "")),
+            summary=str(data.get("summary", "")),
+            content=str(data.get("content", "")),
+            response_status=(
+                str(data.get("responseStatus")) if data.get("responseStatus") is not None else None
+            ),
+            created_at=float(data.get("createdAt", time.time())),
+        )
+
+
+@dataclass(slots=True)
+class RequestRecord:
+    """结构化请求追踪表中的单条请求。"""
+
+    request_id: str
+    action: ProtocolAction
+    requester: str
+    recipient: str
+    status: RequestStatus
+    summary: str
+    content: str
+    response_text: str = ""
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    last_responder: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "requestId": self.request_id,
+            "action": self.action,
+            "from": self.requester,
+            "to": self.recipient,
+            "status": self.status,
+            "summary": self.summary,
+            "content": self.content,
+            "responseText": self.response_text,
+            "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
+            "lastResponder": self.last_responder,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "RequestRecord":
+        return cls(
+            request_id=str(data.get("requestId", "")),
+            action=str(data.get("action", "approval_request")),  # type: ignore[arg-type]
+            requester=str(data.get("from", "")),
+            recipient=str(data.get("to", "")),
+            status=str(data.get("status", "pending")),  # type: ignore[arg-type]
+            summary=str(data.get("summary", "")),
+            content=str(data.get("content", "")),
+            response_text=str(data.get("responseText", "")),
+            created_at=float(data.get("createdAt", time.time())),
+            updated_at=float(data.get("updatedAt", time.time())),
+            last_responder=(
+                str(data.get("lastResponder")) if data.get("lastResponder") is not None else None
+            ),
+        )
+
+
+@dataclass(slots=True)
+class TeamInboxItem:
+    """inbox 中的统一载体，区分普通消息和协议消息。"""
+
+    kind: InboxItemKind
+    message: TeamMessage | None = None
+    protocol: ProtocolEnvelope | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        if self.kind == "message" and self.message is not None:
+            return {"kind": "message", "message": self.message.to_dict()}
+        if self.kind == "protocol" and self.protocol is not None:
+            return {"kind": "protocol", "protocol": self.protocol.to_dict()}
+        raise ValueError("无效的 TeamInboxItem")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "TeamInboxItem":
+        kind = str(data.get("kind", "message"))
+        if kind == "protocol":
+            payload = data.get("protocol", {})
+            return cls(
+                kind="protocol",
+                protocol=ProtocolEnvelope.from_dict(dict(payload)),  # type: ignore[arg-type]
+            )
+
+        if "message" in data:
+            return cls(
+                kind="message",
+                message=TeamMessage.from_dict(dict(data.get("message", {}))),  # type: ignore[arg-type]
+            )
+
+        # 兼容旧版 inbox 中直接存 TeamMessage 的行。
+        return cls(
+            kind="message",
+            message=TeamMessage.from_dict(data),
+        )
+
+
 class MessageBus:
     """基于 `.team/inbox/*.jsonl` 的最小消息总线。"""
 
@@ -146,26 +295,45 @@ class MessageBus:
 
         path = self._inbox_path(recipient)
         with path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(message.to_dict(), ensure_ascii=False) + "\n")
+            file.write(
+                json.dumps(
+                    TeamInboxItem(kind="message", message=message).to_dict(),
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
         return message
 
-    def peek_inbox(self, agent_id: str) -> list[TeamMessage]:
+    def send_protocol(self, envelope: ProtocolEnvelope) -> None:
+        """往目标 Agent 的 inbox 追加一条协议消息。"""
+
+        path = self._inbox_path(envelope.recipient)
+        with path.open("a", encoding="utf-8") as file:
+            file.write(
+                json.dumps(
+                    TeamInboxItem(kind="protocol", protocol=envelope).to_dict(),
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    def peek_inbox(self, agent_id: str) -> list[TeamInboxItem]:
         """读取 inbox，但不清空。"""
 
         path = self._inbox_path(agent_id)
         if not path.exists():
             return []
 
-        messages: list[TeamMessage] = []
+        messages: list[TeamInboxItem] = []
         for raw_line in path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line:
                 continue
-            messages.append(TeamMessage.from_dict(json.loads(line)))
+            messages.append(TeamInboxItem.from_dict(json.loads(line)))
         return messages
 
-    def drain_inbox(self, agent_id: str) -> list[TeamMessage]:
+    def drain_inbox(self, agent_id: str) -> list[TeamInboxItem]:
         """读取并清空 inbox。"""
 
         messages = self.peek_inbox(agent_id)
@@ -195,6 +363,8 @@ class MessageBus:
                     continue
                 try:
                     payload = json.loads(line)
+                    if payload.get("kind") == "message":
+                        payload = dict(payload.get("message", {}))
                     message_id = str(payload.get("messageId", ""))
                     max_id = max(max_id, int(message_id.split("-", 1)[1]))
                 except (ValueError, IndexError, json.JSONDecodeError):
@@ -210,16 +380,19 @@ class TeamManager:
         self.root.mkdir(parents=True, exist_ok=True)
         self.agents_dir = self.root / "agents"
         self.inbox_dir = self.root / "inbox"
+        self.requests_dir = self.root / "requests"
         self.history_dir = self.root / "history"
         self.sessions_dir = self.root / "sessions"
         self.config_path = self.root / "config.json"
 
         self.agents_dir.mkdir(parents=True, exist_ok=True)
         self.inbox_dir.mkdir(parents=True, exist_ok=True)
+        self.requests_dir.mkdir(parents=True, exist_ok=True)
         self.history_dir.mkdir(parents=True, exist_ok=True)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
         self.bus = MessageBus(self.inbox_dir)
+        self._next_request_id = self._max_request_id() + 1
         self._ensure_config()
         self._ensure_lead_agent()
 
@@ -267,8 +440,10 @@ class TeamManager:
         lines = ["当前 team roster："]
         for agent in agents:
             pending = self.bus.count_pending(agent.agent_id)
+            pending_requests = self._count_pending_requests(agent.agent_id)
             lines.append(
-                f"- {agent.agent_id} | role={agent.role} | status={agent.status} | pending_messages={pending}"
+                f"- {agent.agent_id} | role={agent.role} | status={agent.status} "
+                f"| pending_messages={pending} | pending_requests={pending_requests}"
             )
         return "\n".join(lines)
 
@@ -342,6 +517,166 @@ class TeamManager:
             f"- type: {message.message_type}"
         )
 
+    def create_request(
+        self,
+        *,
+        sender: str,
+        recipient: str,
+        action: ProtocolAction,
+        summary: str,
+        content: str,
+    ) -> str:
+        """创建一条需要明确状态追踪的协议请求。"""
+
+        validation_error = self._validate_sender_and_recipient(sender=sender, recipient=recipient)
+        if validation_error is not None:
+            return validation_error
+
+        request_id = f"req-{self._next_request_id:04d}"
+        self._next_request_id += 1
+        now = time.time()
+        record = RequestRecord(
+            request_id=request_id,
+            action=action,
+            requester=sender,
+            recipient=recipient,
+            status="pending",
+            summary=summary.strip(),
+            content=content.strip(),
+            created_at=now,
+            updated_at=now,
+        )
+        self._save_request(record)
+
+        self.bus.send_protocol(
+            ProtocolEnvelope(
+                request_id=request_id,
+                envelope_type="request",
+                action=action,
+                sender=sender,
+                recipient=recipient,
+                summary=record.summary,
+                content=record.content,
+                response_status=None,
+                created_at=now,
+            )
+        )
+        self._write_config()
+        return (
+            "已创建 protocol request：\n"
+            f"- request_id: {request_id}\n"
+            f"- action: {action}\n"
+            f"- from: {sender}\n"
+            f"- to: {recipient}\n"
+            f"- status: pending"
+        )
+
+    def respond_request(
+        self,
+        *,
+        responder: str,
+        request_id: str,
+        status: RequestStatus,
+        response_text: str,
+    ) -> str:
+        """更新请求状态，并在需要时回发协议响应。"""
+
+        try:
+            record = self.load_request(request_id)
+        except ValueError as exc:
+            return f"错误：{exc}"
+
+        if responder not in {record.requester, record.recipient}:
+            return f"错误：Agent '{responder}' 无权更新请求 '{request_id}'"
+        if responder == record.requester and status != "cancelled":
+            return "错误：请求发起方只能把请求更新为 cancelled"
+        if responder == record.recipient and status == "cancelled":
+            return "错误：请求接收方不能直接把请求更新为 cancelled"
+
+        transition_error = self._validate_request_transition(record.status, status)
+        if transition_error is not None:
+            return transition_error
+
+        record.status = status
+        record.response_text = response_text.strip()
+        record.updated_at = time.time()
+        record.last_responder = responder
+        self._save_request(record)
+
+        if responder != record.requester:
+            self.bus.send_protocol(
+                ProtocolEnvelope(
+                    request_id=record.request_id,
+                    envelope_type="response",
+                    action=record.action,
+                    sender=responder,
+                    recipient=record.requester,
+                    summary=record.summary,
+                    content=record.response_text,
+                    response_status=status,
+                    created_at=time.time(),
+                )
+            )
+
+        self._write_config()
+        return (
+            "已更新 protocol request：\n"
+            f"- request_id: {record.request_id}\n"
+            f"- action: {record.action}\n"
+            f"- status: {record.status}\n"
+            f"- responder: {responder}"
+        )
+
+    def acknowledge_request(self, *, agent_id: str, request_id: str) -> None:
+        """当接收方实际读取到请求时，自动把 pending 更新为 acknowledged。"""
+
+        try:
+            record = self.load_request(request_id)
+        except ValueError:
+            return
+
+        if record.recipient != agent_id:
+            return
+        if record.status != "pending":
+            return
+
+        record.status = "acknowledged"
+        record.updated_at = time.time()
+        record.last_responder = agent_id
+        self._save_request(record)
+        self._write_config()
+
+    def get_request(self, request_id: str) -> str:
+        """查看单条请求追踪记录。"""
+
+        try:
+            record = self.load_request(request_id)
+        except ValueError as exc:
+            return f"错误：{exc}"
+        return json.dumps(record.to_dict(), ensure_ascii=False, indent=2)
+
+    def list_requests(self, agent_id: str | None = None) -> str:
+        """列出当前请求追踪表。"""
+
+        requests = self._all_requests()
+        if agent_id is not None:
+            requests = [
+                item
+                for item in requests
+                if item.requester == agent_id or item.recipient == agent_id
+            ]
+
+        if not requests:
+            return "当前没有 protocol requests。"
+
+        lines = ["当前 protocol requests："]
+        for record in requests:
+            lines.append(
+                f"- {record.request_id} | action={record.action} | "
+                f"from={record.requester} | to={record.recipient} | status={record.status}"
+            )
+        return "\n".join(lines)
+
     def list_inbox(self, agent_id: str) -> str:
         """查看某个 Agent 当前 inbox 中的待处理消息。"""
 
@@ -355,16 +690,36 @@ class TeamManager:
             return f"Agent '{agent_id}' 的 inbox 为空。"
 
         lines = [f"Agent '{agent_id}' 当前 inbox："]
-        for message in messages:
-            lines.append(
-                f"- {message.message_id} | from={message.sender} | type={message.message_type} | content={message.content[:80]}"
-            )
+        for item in messages:
+            if item.kind == "message" and item.message is not None:
+                message = item.message
+                lines.append(
+                    f"- message {message.message_id} | from={message.sender} | "
+                    f"type={message.message_type} | content={message.content[:80]}"
+                )
+                continue
+
+            if item.kind == "protocol" and item.protocol is not None:
+                protocol = item.protocol
+                lines.append(
+                    f"- protocol {protocol.request_id} | envelope={protocol.envelope_type} | "
+                    f"action={protocol.action} | from={protocol.sender} | "
+                    f"status={protocol.response_status or 'pending'} | summary={protocol.summary[:60]}"
+                )
         return "\n".join(lines)
 
-    def drain_inbox(self, agent_id: str) -> list[TeamMessage]:
+    def drain_inbox(self, agent_id: str) -> list[TeamInboxItem]:
         """供运行器读取并清空 inbox。"""
 
         return self.bus.drain_inbox(agent_id)
+
+    def load_request(self, request_id: str) -> RequestRecord:
+        """读取单条请求追踪记录。"""
+
+        path = self.requests_dir / f"{request_id}.json"
+        if not path.exists():
+            raise ValueError(f"请求 '{request_id}' 不存在")
+        return RequestRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     def load_history(self, agent_id: str) -> list[ConversationMessage]:
         """读取某个 Agent 的持久化历史。"""
@@ -400,6 +755,8 @@ class TeamManager:
             f"你的职责描述：{agent.description or '（未填写）'}\n"
             "你会保留自己的历史和身份，来自 inbox 的 team 消息会被追加进你的上下文。\n"
             "如果需要把结论、阻塞或请求发给其他 Agent，请使用 team_send_message。\n"
+            "如果需要发起审批、关机、交接或签收这类结构化请求，请使用 team_send_protocol。\n"
+            "如果你收到 protocol request 并需要更新状态，请使用 team_respond_protocol。\n"
             "不要尝试创建、关闭或直接运行其他 teammate，除非外层显式提供了那类工具。\n"
         )
         if agent.system_prompt.strip():
@@ -456,6 +813,7 @@ class TeamManager:
                     "description": agent.description,
                     "status": agent.status,
                     "pendingMessages": self.bus.count_pending(agent.agent_id),
+                    "pendingRequests": self._count_pending_requests(agent.agent_id),
                     "updatedAt": agent.updated_at,
                 }
                 for agent in self._all_agents()
@@ -483,6 +841,78 @@ class TeamManager:
         if not path.exists():
             raise ValueError(f"Agent '{agent_id}' 不存在")
         return TeamAgentRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def _save_request(self, record: RequestRecord) -> None:
+        """保存单条请求追踪记录。"""
+
+        (self.requests_dir / f"{record.request_id}.json").write_text(
+            json.dumps(record.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _all_requests(self) -> list[RequestRecord]:
+        """读取全部请求追踪记录。"""
+
+        requests = [
+            RequestRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            for path in self.requests_dir.glob("req-*.json")
+        ]
+        requests.sort(key=lambda item: item.request_id)
+        return requests
+
+    def _count_pending_requests(self, agent_id: str) -> int:
+        """统计某个 Agent 相关的未结束请求数。"""
+
+        terminal = {"approved", "rejected", "completed", "cancelled", "failed"}
+        return sum(
+            1
+            for record in self._all_requests()
+            if agent_id in {record.requester, record.recipient} and record.status not in terminal
+        )
+
+    def _max_request_id(self) -> int:
+        """扫描现有 request id 的最大值。"""
+
+        max_id = 0
+        for path in self.requests_dir.glob("req-*.json"):
+            stem = path.stem
+            try:
+                max_id = max(max_id, int(stem.split("-", 1)[1]))
+            except (ValueError, IndexError):
+                continue
+        return max_id
+
+    def _validate_sender_and_recipient(self, *, sender: str, recipient: str) -> str | None:
+        """统一校验消息和请求的参与方。"""
+
+        if not self._agent_path(recipient).exists():
+            return f"错误：目标 Agent '{recipient}' 不存在"
+        if not self._agent_path(sender).exists():
+            return f"错误：发送方 Agent '{sender}' 不存在"
+
+        recipient_agent = self._load_agent(recipient)
+        if recipient_agent.status == "shutdown":
+            return f"错误：目标 Agent '{recipient}' 已 shutdown"
+        return None
+
+    @staticmethod
+    def _validate_request_transition(current: RequestStatus, new: RequestStatus) -> str | None:
+        """校验请求状态迁移是否合法。"""
+
+        allowed: dict[RequestStatus, set[RequestStatus]] = {
+            "pending": {"acknowledged", "approved", "rejected", "completed", "cancelled", "failed"},
+            "acknowledged": {"approved", "rejected", "completed", "cancelled", "failed"},
+            "approved": {"completed", "failed", "cancelled"},
+            "rejected": set(),
+            "completed": set(),
+            "cancelled": set(),
+            "failed": set(),
+        }
+        if new == current:
+            return None
+        if new not in allowed.get(current, set()):
+            return f"错误：请求状态不能从 {current} 迁移到 {new}"
+        return None
 
     def _save_agent(self, agent: TeamAgentRecord) -> None:
         """保存单个 teammate 元数据。"""
@@ -575,9 +1005,9 @@ class TeamAgentRunner:
         if agent.status == "working":
             return f"错误：Agent '{agent_id}' 当前正在 working"
 
-        inbox_messages = self.team_manager.drain_inbox(agent_id)
+        inbox_items = self.team_manager.drain_inbox(agent_id)
         self.team_manager._write_config()
-        if not inbox_messages:
+        if not inbox_items:
             return f"Agent '{agent_id}' 的 inbox 为空，无需运行。"
 
         history = self.team_manager.load_history(agent_id)
@@ -594,19 +1024,59 @@ class TeamAgentRunner:
             scope=f"team:{agent_id}:startup",
         )
 
-        for inbound in inbox_messages:
-            user_message = ConversationMessage(
-                role="user",
-                content=(
-                    "<team_message>\n"
-                    f"from: {inbound.sender}\n"
-                    f"type: {inbound.message_type}\n"
-                    f"content:\n{inbound.content}\n"
-                    "</team_message>"
-                ),
-            )
-            history.append(user_message)
-            session_logger.append_message(user_message, scope=f"team:{agent_id}:inbox")
+        message_items: list[TeamMessage] = []
+        for inbound in inbox_items:
+            if inbound.kind == "message" and inbound.message is not None:
+                message_items.append(inbound.message)
+                user_message = ConversationMessage(
+                    role="user",
+                    content=(
+                        "<team_message>\n"
+                        f"from: {inbound.message.sender}\n"
+                        f"type: {inbound.message.message_type}\n"
+                        f"content:\n{inbound.message.content}\n"
+                        "</team_message>"
+                    ),
+                )
+                history.append(user_message)
+                session_logger.append_message(user_message, scope=f"team:{agent_id}:inbox")
+                continue
+
+            if inbound.kind == "protocol" and inbound.protocol is not None:
+                if inbound.protocol.envelope_type == "request":
+                    self.team_manager.acknowledge_request(
+                        agent_id=agent_id,
+                        request_id=inbound.protocol.request_id,
+                    )
+                    protocol_message = ConversationMessage(
+                        role="user",
+                        content=(
+                            "<protocol_request>\n"
+                            f"request_id: {inbound.protocol.request_id}\n"
+                            f"from: {inbound.protocol.sender}\n"
+                            f"action: {inbound.protocol.action}\n"
+                            f"summary: {inbound.protocol.summary}\n"
+                            f"content:\n{inbound.protocol.content}\n"
+                            "如果你决定批准、拒绝、完成或确认，请使用 team_respond_protocol。\n"
+                            "</protocol_request>"
+                        ),
+                    )
+                else:
+                    protocol_message = ConversationMessage(
+                        role="user",
+                        content=(
+                            "<protocol_response>\n"
+                            f"request_id: {inbound.protocol.request_id}\n"
+                            f"from: {inbound.protocol.sender}\n"
+                            f"action: {inbound.protocol.action}\n"
+                            f"status: {inbound.protocol.response_status or 'unknown'}\n"
+                            f"summary: {inbound.protocol.summary}\n"
+                            f"content:\n{inbound.protocol.content}\n"
+                            "</protocol_response>"
+                        ),
+                    )
+                history.append(protocol_message)
+                session_logger.append_message(protocol_message, scope=f"team:{agent_id}:inbox")
 
         self.team_manager.set_status(agent_id, "working")
         try:
@@ -640,7 +1110,7 @@ class TeamAgentRunner:
 
         reply_senders = {
             message.sender
-            for message in inbox_messages
+            for message in message_items
             if message.sender != agent_id and message.message_type != "result"
         }
         for sender in sorted(reply_senders):
@@ -654,14 +1124,14 @@ class TeamAgentRunner:
         if reply_senders:
             recipients = ", ".join(sorted(reply_senders))
             return (
-                f"已运行 teammate '{agent_id}'，处理消息 {len(inbox_messages)} 条。\n"
+                f"已运行 teammate '{agent_id}'，处理 inbox 项 {len(inbox_items)} 条。\n"
                 f"运行状态：{run_result.status}\n"
                 f"已自动把结果回发给：{recipients}\n"
                 f"结果摘要：\n{run_result.final_text}"
             )
 
         return (
-            f"已运行 teammate '{agent_id}'，处理消息 {len(inbox_messages)} 条。\n"
+            f"已运行 teammate '{agent_id}'，处理 inbox 项 {len(inbox_items)} 条。\n"
             f"运行状态：{run_result.status}\n"
             f"结果摘要：\n{run_result.final_text}"
         )

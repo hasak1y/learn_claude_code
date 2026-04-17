@@ -52,10 +52,14 @@ from agent_runtime.tools.task_graph import (
 )
 from agent_runtime.tools.team import (
     GetTeamAgentTool,
+    GetTeamRequestTool,
     ListTeamAgentsTool,
+    ListTeamRequestsTool,
     PeekTeamInboxTool,
+    RespondTeamProtocolTool,
     RunTeamAgentTool,
     SendTeamMessageTool,
+    SendTeamProtocolTool,
     ShutdownTeamAgentTool,
     SpawnTeamAgentTool,
 )
@@ -144,6 +148,8 @@ def build_system_prompt(
         "task 会同步调用一个 fresh context 的子代理，父 Agent 会等待子代理返回最终文本。\n"
         "当你需要创建可跨多轮存活、拥有固定身份和独立历史的 teammate 时，使用 team_spawn_agent。\n"
         "当你需要把任务、备注或结果发给 teammate 时，使用 team_send_message。\n"
+        "当你需要发起审批、关机、交接或签收这类需要明确 request_id 和状态追踪的动作时，使用 team_send_protocol。\n"
+        "当你收到 protocol request 并需要确认、批准、拒绝或完成时，使用 team_respond_protocol。\n"
         "当前开启了权限审查：敏感操作需要用户确认。\n"
         "长期规则层和长期经验层会通过后续上下文消息注入，而不是直接写死在 system prompt 中。\n"
         "这些都属于外置上下文，不代表模型权重已经学会了它们。\n"
@@ -189,6 +195,8 @@ def build_team_agent_base_prompt(
         "你会跨多轮处理自己的 inbox 任务，并保留自己的历史。\n"
         "需要时使用工具，回答保持简洁。\n"
         "如果需要把结论、阻塞或协作请求发给其他 teammate，请使用 team_send_message。\n"
+        "如果需要发起审批、关机、交接或签收这类结构化请求，请使用 team_send_protocol。\n"
+        "如果你收到了 protocol request，需要更新其状态时请使用 team_respond_protocol。\n"
         "读取文件时优先使用 read_file。\n"
         "创建或整体覆盖文本文件时优先使用 write_file。\n"
         "修改已有文件时优先使用 edit_file。\n"
@@ -289,8 +297,12 @@ def build_team_agent_tool_registry(
             CompactTool(),
             LoadSkillTool(skill_registry=skill_registry),
             SendTeamMessageTool(manager=team_manager, sender_id=sender_id),
+            SendTeamProtocolTool(manager=team_manager, sender_id=sender_id),
+            RespondTeamProtocolTool(manager=team_manager, sender_id=sender_id),
             ListTeamAgentsTool(manager=team_manager),
             GetTeamAgentTool(manager=team_manager),
+            ListTeamRequestsTool(manager=team_manager),
+            GetTeamRequestTool(manager=team_manager),
             ReadFileTool(cwd=os.getcwd()),
             WriteFileTool(cwd=os.getcwd()),
             EditFileTool(cwd=os.getcwd()),
@@ -328,7 +340,11 @@ def build_parent_tool_registry(
             ListTeamAgentsTool(manager=team_manager),
             GetTeamAgentTool(manager=team_manager),
             SendTeamMessageTool(manager=team_manager, sender_id="lead"),
+            SendTeamProtocolTool(manager=team_manager, sender_id="lead"),
+            RespondTeamProtocolTool(manager=team_manager, sender_id="lead"),
             PeekTeamInboxTool(manager=team_manager),
+            ListTeamRequestsTool(manager=team_manager),
+            GetTeamRequestTool(manager=team_manager),
             RunTeamAgentTool(runner=team_runner),
             ShutdownTeamAgentTool(manager=team_manager),
             TaskTool(runner=subagent_runner),

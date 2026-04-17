@@ -136,6 +136,150 @@ class SendTeamMessageTool(BaseTool):
         )
 
 
+class SendTeamProtocolTool(BaseTool):
+    """创建一条需要请求-响应追踪的 protocol request。"""
+
+    name = "team_send_protocol"
+    description = (
+        "创建一条带 request_id 的协议请求，并投递到目标 teammate 的 inbox。"
+        "适合审批、关机请求、交接和签收。"
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "to_agent": {
+                "type": "string",
+                "description": "目标 teammate 的 agent_id。",
+            },
+            "action": {
+                "type": "string",
+                "enum": [
+                    "approval_request",
+                    "shutdown_request",
+                    "handoff_request",
+                    "ack_request",
+                ],
+                "description": "协议动作类型。",
+            },
+            "summary": {
+                "type": "string",
+                "description": "供对方快速理解请求目的的短摘要。",
+            },
+            "content": {
+                "type": "string",
+                "description": "详细说明或上下文。",
+            },
+        },
+        "required": ["to_agent", "action", "summary"],
+    }
+
+    def __init__(self, manager: TeamManager, sender_id: str) -> None:
+        self.manager = manager
+        self.sender_id = sender_id
+
+    def execute(self, arguments: dict[str, Any]) -> str:
+        return self.manager.create_request(
+            sender=self.sender_id,
+            recipient=str(arguments.get("to_agent", "")).strip(),
+            action=str(arguments.get("action", "approval_request")).strip(),  # type: ignore[arg-type]
+            summary=str(arguments.get("summary", "")).strip(),
+            content=str(arguments.get("content", "")),
+        )
+
+
+class RespondTeamProtocolTool(BaseTool):
+    """更新一条 protocol request 的状态，并在需要时回发 response。"""
+
+    name = "team_respond_protocol"
+    description = (
+        "更新某条 protocol request 的状态，例如 acknowledged、approved、rejected、completed。"
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "request_id": {
+                "type": "string",
+                "description": "要更新的 request_id。",
+            },
+            "status": {
+                "type": "string",
+                "enum": [
+                    "acknowledged",
+                    "approved",
+                    "rejected",
+                    "completed",
+                    "cancelled",
+                    "failed",
+                ],
+                "description": "新的请求状态。",
+            },
+            "response_text": {
+                "type": "string",
+                "description": "给请求方看的响应文本，可选。",
+            },
+        },
+        "required": ["request_id", "status"],
+    }
+
+    def __init__(self, manager: TeamManager, sender_id: str) -> None:
+        self.manager = manager
+        self.sender_id = sender_id
+
+    def execute(self, arguments: dict[str, Any]) -> str:
+        return self.manager.respond_request(
+            responder=self.sender_id,
+            request_id=str(arguments.get("request_id", "")).strip(),
+            status=str(arguments.get("status", "")).strip(),  # type: ignore[arg-type]
+            response_text=str(arguments.get("response_text", "")),
+        )
+
+
+class GetTeamRequestTool(BaseTool):
+    """查看单条 protocol request。"""
+
+    name = "team_get_request"
+    description = "查看某条 protocol request 的完整追踪记录。"
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "request_id": {
+                "type": "string",
+                "description": "要查看的 request_id。",
+            }
+        },
+        "required": ["request_id"],
+    }
+
+    def __init__(self, manager: TeamManager) -> None:
+        self.manager = manager
+
+    def execute(self, arguments: dict[str, Any]) -> str:
+        return self.manager.get_request(str(arguments.get("request_id", "")).strip())
+
+
+class ListTeamRequestsTool(BaseTool):
+    """列出 protocol requests。"""
+
+    name = "team_list_requests"
+    description = "列出当前 protocol requests，可按 agent_id 粗过滤。"
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "agent_id": {
+                "type": "string",
+                "description": "可选，只列出与某个 Agent 相关的请求。",
+            }
+        },
+    }
+
+    def __init__(self, manager: TeamManager) -> None:
+        self.manager = manager
+
+    def execute(self, arguments: dict[str, Any]) -> str:
+        agent_id = str(arguments.get("agent_id", "")).strip() or None
+        return self.manager.list_requests(agent_id=agent_id)
+
+
 class PeekTeamInboxTool(BaseTool):
     """查看某个 teammate 当前 inbox。"""
 
