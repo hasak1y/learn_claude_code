@@ -1,4 +1,4 @@
-"""父 Agent 专属的任务图工具。"""
+"""父 Agent 和 teammate 共用的任务图工具。"""
 
 from __future__ import annotations
 
@@ -74,6 +74,8 @@ class UpdateTaskTool(BaseTool):
     description = (
         "更新任务图中的任务。"
         "可修改状态、增加依赖、移除依赖或更新标题说明。"
+        "如果提供 base_version，就会启用乐观并发控制："
+        "只有任务版本仍然匹配时才会写入。"
     )
     input_schema = {
         "type": "object",
@@ -81,6 +83,10 @@ class UpdateTaskTool(BaseTool):
             "task_id": {
                 "type": "integer",
                 "description": "任务 id。",
+            },
+            "base_version": {
+                "type": "integer",
+                "description": "本次更新基于的任务版本号，可选。建议先 task_get 再带着 version 更新。",
             },
             "status": {
                 "type": "string",
@@ -126,12 +132,29 @@ class UpdateTaskTool(BaseTool):
         except (TypeError, ValueError):
             return "错误：task_id 必须是整数"
 
+        raw_base_version = arguments.get("base_version")
+        if raw_base_version is None:
+            base_version = None
+        else:
+            try:
+                base_version = int(raw_base_version)
+            except (TypeError, ValueError):
+                return "错误：base_version 必须是整数"
+
         add_blocked_by = arguments.get("add_blocked_by")
         remove_blocked_by = arguments.get("remove_blocked_by")
 
         try:
-            add_dependency_ids = [int(item) for item in add_blocked_by] if isinstance(add_blocked_by, list) else None
-            remove_dependency_ids = [int(item) for item in remove_blocked_by] if isinstance(remove_blocked_by, list) else None
+            add_dependency_ids = (
+                [int(item) for item in add_blocked_by]
+                if isinstance(add_blocked_by, list)
+                else None
+            )
+            remove_dependency_ids = (
+                [int(item) for item in remove_blocked_by]
+                if isinstance(remove_blocked_by, list)
+                else None
+            )
         except (TypeError, ValueError):
             return "错误：依赖 id 必须是整数"
 
@@ -142,12 +165,29 @@ class UpdateTaskTool(BaseTool):
 
         return self.manager.update(
             task_id=task_id,
-            status=str(arguments["status"]).strip() if "status" in arguments and arguments.get("status") is not None else None,
+            base_version=base_version,
+            status=(
+                str(arguments["status"]).strip()
+                if "status" in arguments and arguments.get("status") is not None
+                else None
+            ),
             add_blocked_by=add_dependency_ids,
             remove_blocked_by=remove_dependency_ids,
-            subject=str(arguments["subject"]) if "subject" in arguments and arguments.get("subject") is not None else None,
-            description=str(arguments["description"]) if "description" in arguments and arguments.get("description") is not None else None,
-            owner=str(arguments["owner"]) if "owner" in arguments and arguments.get("owner") is not None else None,
+            subject=(
+                str(arguments["subject"])
+                if "subject" in arguments and arguments.get("subject") is not None
+                else None
+            ),
+            description=(
+                str(arguments["description"])
+                if "description" in arguments and arguments.get("description") is not None
+                else None
+            ),
+            owner=(
+                str(arguments["owner"])
+                if "owner" in arguments and arguments.get("owner") is not None
+                else None
+            ),
         )
 
 

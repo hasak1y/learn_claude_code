@@ -198,6 +198,7 @@ def build_team_agent_base_prompt(
         "如果需要发起审批、关机、交接或签收这类结构化请求，请使用 team_send_protocol。\n"
         "如果你收到了 protocol request，需要更新其状态时请使用 team_respond_protocol。\n"
         "你可以使用 task_get / task_update / task_list_ready / task_list_all 查看或更新任务图，但不要创建新任务。\n"
+        "更新任务前优先先用 task_get 读取最新 version，再把 base_version 带给 task_update，避免覆盖其他 Agent 的更新。\n"
         "读取文件时优先使用 read_file。\n"
         "创建或整体覆盖文本文件时优先使用 write_file。\n"
         "修改已有文件时优先使用 edit_file。\n"

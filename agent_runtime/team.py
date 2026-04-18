@@ -766,6 +766,7 @@ class TeamManager:
             "如果需要发起审批、关机、交接或签收这类结构化请求，请使用 team_send_protocol。\n"
             "如果你收到 protocol request 并需要更新状态，请使用 team_respond_protocol。\n"
             "你可以使用 task_get / task_update / task_list_ready / task_list_all 查看或更新任务图，但不要创建新任务。\n"
+            "更新任务前，优先先用 task_get 读取最新 version，再把 base_version 带给 task_update，避免覆盖其他 Agent 的更新。\n"
             "不要尝试创建、关闭或直接运行其他 teammate，除非外层显式提供了那类工具。\n"
         )
         if agent.system_prompt.strip():
@@ -1173,7 +1174,8 @@ class TeamAgentRunner:
             f"claimed_by: {task.claimed_by}\n"
             f"description:\n{task.description or '（无）'}\n\n"
             "这是你在空闲状态下自动认领的一项 ready 任务。"
-            "你可以使用 task_get 查看完整任务信息，并在完成后使用 task_update 把它更新为 completed。"
+            "你可以使用 task_get 查看完整任务信息。更新状态前先读取最新 version，"
+            "然后把 base_version 一起带给 task_update，再把任务更新为 completed。"
             "</auto_claimed_task>"
         )
 
