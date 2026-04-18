@@ -37,6 +37,202 @@
   错误分类与恢复决策
 - [E:\github\learn_claude_code\agent_runtime\compaction.py](E:\github\learn_claude_code\agent_runtime\compaction.py)
   上下文压缩
+- [E:\github\learn_claude_code\agent_runtime\mcp_client.py](E:\github\learn_claude_code\agent_runtime\mcp_client.py)
+  MCP client，支持 stdio 与 HTTP 两类 transport
+- [E:\github\learn_claude_code\agent_runtime\tool_router.py](E:\github\learn_claude_code\agent_runtime\tool_router.py)
+  统一工具路由层，把本地工具和 MCP 工具接到同一个执行入口
+
+## 工具系统
+
+当前工具系统已经从“全部本地硬编码”升级成“本地工具 + MCP 工具”两种来源。
+
+### 本地工具
+
+本地工具仍然保留原来的命名方式，例如：
+
+- `read_file`
+- `task_create`
+- `team_send_message`
+
+它们直接对应本地 `BaseTool` 实现。
+
+### MCP 工具
+
+MCP 工具在逻辑上统一表示为：
+
+```text
+mcp.<server>.<tool>
+```
+
+例如：
+
+- `mcp.github.search_prs`
+- `mcp.mock.echo`
+
+但真正注册给模型的 schema name 会转成安全格式：
+
+```text
+mcp__<server>__<tool>
+```
+
+例如：
+
+- `mcp__github__search_prs`
+- `mcp__smart_search__ai_search_github`
+
+这样做的目的很明确：
+
+- 一眼看出工具来源
+- 避免和本地工具撞名
+- 兼容 OpenAI-compatible 工具名只允许字母、数字、下划线和短横线的限制
+- 方便后续做权限控制、日志和错误分类
+
+### 统一工具描述
+
+现在工具注册时不会只保留“一个本地工具实例”，而是统一转成 `ToolSpec`：
+
+- `name`
+- `description`
+- `input_schema`
+- `source`
+
+其中 `source` 目前只分两类：
+
+- `local`
+- `mcp`
+
+也就是说，工具描述和工具执行已经分离。前者告诉模型“有哪些工具”，后者决定“这个工具到底怎么执行”。
+
+### 统一路由器
+
+`ToolRouter` 只做一件事：
+
+- 如果是本地工具，就交给本地 handler
+- 如果是 MCP 工具，就交给 `MCPClient`
+
+Router 不关心 `shell / task / github` 这些业务语义，只关心工具来源。
+
+### MCP client
+
+`MCPClient` 当前支持两类 transport，负责：
+
+1. 连接 MCP server
+2. 做 `initialize`
+3. 拉 `tools/list`
+4. 执行 `tools/call`
+
+当前支持通过两种方式加载 MCP server 配置：
+
+- 环境变量 `MCP_SERVERS_JSON`
+- 仓库内 `.mcp/servers.json`
+
+一个 stdio 示例：
+
+```json
+{
+  "servers": {
+    "mock": {
+      "command": "python",
+      "args": ["-m", "agent_runtime.mock_mcp_server"],
+      "cwd": "E:/github/learn_claude_code"
+    }
+  }
+}
+```
+
+一个 HTTP 示例：
+
+```json
+{
+  "servers": {
+    "smart_search": {
+      "transport": "http",
+      "url": "https://mcpmarket.cn/mcp/ec9e8779bf4ced5c048d22f6",
+      "tools": ["ai_search_web", "ai_search_github"]
+    }
+  }
+}
+```
+
+其中：
+
+- `stdio` transport 通过本地 `command + args` 启动进程
+- `http` transport 直接对远端 URL 发 JSON-RPC 请求
+- `http` transport 兼容普通 JSON 与 `text/event-stream` 响应
+- 如果服务端返回 `mcp-session-id`，client 会在后续请求里自动带上
+- `tools` 可选，用来限制只注册该 server 下的一部分工具，减小每轮发送给 LLM 的 tools 负载
+
+配置完成后，重新启动 `main.py`，对应 server 暴露的工具会自动注册成安全 schema 名：
+
+```text
+mcp__<server>__<tool>
+```
+
+例如：
+
+```text
+mcp__mock__echo
+```
+
+### 当前边界
+
+这一版先把“工具来源可插拔”打通，暂时还没有做：
+
+- MCP server 生命周期管理优化
+- 更细的 MCP 错误恢复
+- MCP 工具级别的权限细分
+
+但路由和命名规则已经固定，后续可以继续扩。
+
+## 权限系统
+
+权限系统现在不仅能判断本地工具，也能判断 MCP 工具。
+
+### 本地工具
+
+本地工具继续按原名匹配，例如：
+
+- `read_file`
+- `write_file`
+- `team_run_agent`
+
+### MCP 工具
+
+MCP 工具在逻辑上仍按完整名匹配，例如：
+
+- `mcp.github.search_prs`
+- `mcp.figma.get_design_context`
+
+虽然真正发给模型的是安全工具名，例如：
+
+- `mcp__github__search_prs`
+- `mcp__figma__get_design_context`
+
+但权限系统会自动把安全名恢复成逻辑名，所以权限规则仍然推荐按点号写。
+
+为了避免把某个 server 的规则写死在代码里，权限系统支持通过环境变量配置通配符：
+
+- `PERMISSION_ALLOW_TOOL_PATTERNS`
+- `PERMISSION_DENY_TOOL_PATTERNS`
+
+规则格式是：
+
+- 逗号分隔
+- 支持 shell 风格通配符
+
+例如：
+
+```text
+PERMISSION_ALLOW_TOOL_PATTERNS=mcp.github.*
+```
+
+或者更细一点：
+
+```text
+PERMISSION_ALLOW_TOOL_PATTERNS=mcp.github.get_*,mcp.github.list_*,mcp.github.search_*
+```
+
+这意味着后续如果你接入真实 GitHub MCP server，就可以直接按工具名前缀决定放行、拒绝或进入确认流程，而不需要再为每个 server 写一套单独逻辑。
 
 ## 运行模型
 
@@ -211,6 +407,7 @@ team 通信分成两层。
 - 关机请求
 - 交接
 - 签收
+- 集成候选审查
 
 使用：
 
@@ -220,6 +417,13 @@ team 通信分成两层。
 - `team_list_requests`
 
 每条协议请求都会持久化为 `.team/requests/<request_id>.json`。inbox 只负责投递，状态追踪走请求表。
+
+当前已经实际使用到的 review 相关动作包括：
+
+- `integration_request`
+- `approved`
+- `changes_requested`
+- `rejected`
 
 ## Hook 与权限
 
@@ -300,6 +504,36 @@ runtime 现在是恢复导向的，不只是“捕获异常”。
 - 两个更新互相覆盖
 - 写入过程中留下半截 JSON
 
+当前任务状态已经区分：
+
+- `in_progress`：正在实现
+- `integration_pending`：候选改动已在独立 worktree 中完成并提交审查，但还没进入主线
+- `completed`：已经真正集成回主线
+- `cancelled`：用户明确不要了
+- `abandoned`：旧会话遗留的未完成任务，当前默认不继续
+
+### 跨会话默认失活
+
+任务图现在会记录：
+
+- `createdInSession`
+- `taskBatchId`
+
+程序启动新会话时，会自动扫描旧任务：
+
+- 旧会话里遗留的 `pending / in_progress / integration_pending`
+- 默认都会被标记为 `abandoned`
+
+这样做的目的不是删除任务，而是避免新会话在没有用户明确要求的情况下，自动继续上次做到一半的工作。
+
+如果用户明确说：
+
+- “继续上次任务”
+- “恢复之前的任务”
+- “接着做 task 2”
+
+这时再使用 `task_restore` 把 `abandoned / cancelled` 任务恢复回 `pending` 或 `in_progress`。
+
 ### 3. 依赖关系
 
 任务依赖仍然是静态边：
@@ -331,6 +565,91 @@ runtime 现在是恢复导向的，不只是“捕获异常”。
 
 teammate 的系统提示词也已经按这个流程约束。
 
+## Worktree 注册表
+
+task graph 解决的是“任务控制面”，并不负责工作目录隔离。
+
+所以项目又单独加了一层 worktree 注册表，用来回答：
+
+- 这个任务在哪个独立工作区里执行
+- 这个工作区属于哪个 agent
+- 对应哪个 task
+- 目录路径和分支名是什么
+
+当前实现放在：
+
+- [E:\github\learn_claude_code\agent_runtime\worktree.py](E:\github\learn_claude_code\agent_runtime\worktree.py)
+
+状态目录默认是：
+
+```text
+.worktrees/
+  registry/
+  locks/
+```
+
+真正的 git worktree 默认创建在仓库同级目录下：
+
+```text
+../learn_claude_code_worktrees/
+```
+
+### 为什么单独做这一层
+
+因为：
+
+- task graph 负责“做什么、谁在做、状态如何”
+- worktree registry 负责“在哪做、目录在哪、对应哪个任务”
+
+这两层通过 `task_id` / `agent_id` 关联，但不混在一个结构里。
+
+### 现在的运行方式
+
+当持久 teammate 自动认领任务时：
+
+1. 先 claim task
+2. 再为该 task / agent 分配或复用一个 worktree
+3. 把 worktree 路径写进注册表
+4. teammate 本轮使用的文件工具和 shell 工具都会切到这个目录
+
+也就是说，多个 teammate 即使同时工作，也不会默认都在主仓库目录里互相踩文件。
+
+### PR 式集成流程
+
+当前 worktree 还承担了最小的“候选变更 -> review -> integrate”流程，思路接近 PR / code review：
+
+1. teammate 在独立 worktree 中完成改动
+2. teammate 使用 `worktree_submit_for_review`
+3. 系统把这项改动标成 `review_pending`，并把任务状态切到 `integration_pending`
+4. 同时给 `lead` 发起一条 `integration_request`
+5. lead 使用 `worktree_get_record / worktree_get_diff` 审查候选变更
+6. lead 使用 `worktree_review_decision`
+   - `approved`
+   - `changes_requested`
+   - `rejected`
+7. `changes_requested / rejected` 会把任务退回 `pending`
+8. 只有 `approved` 的候选变更，lead 才能使用 `worktree_integrate` 合回主仓库当前分支
+9. 集成成功后，任务才会被标记为 `completed`
+
+也就是说：
+
+- teammate 负责产出候选改动
+- lead 负责 review 和最后集成
+- “完成任务”不等于“自动并入主线”
+
+### 和乐观并发的关系
+
+这两者不冲突，解决的是两类不同问题：
+
+- worktree：解决代码工作区并发
+- version + 锁：解决共享状态写入并发
+
+所以当前设计是：
+
+- 代码执行面隔离到不同 worktree
+- 控制面状态仍然集中在 task graph / request record
+- 集中状态继续靠版本和锁保护
+
 ## 主要工具
 
 父 Agent 主要能力：
@@ -340,6 +659,8 @@ teammate 的系统提示词也已经按这个流程约束。
 - 后台任务
 - todo
 - task graph
+- task restore / abandoned task 查询
+- worktree review / integrate
 - compact
 - load_skill
 - task
@@ -369,6 +690,7 @@ agent_runtime/
   team.py
   todo.py
   types.py
+  worktree.py
   llm/
   tools/
 skills/
@@ -410,10 +732,10 @@ python main.py
 - team 协议层
 - 恢复导向 runtime
 - 带最小并发控制的持久化任务图
+- 任务级 git worktree 注册表
 
 还没有覆盖的方向包括：
 
-- worktree 注册表
 - 更完整的多 Agent 工作区隔离
 - 更强的任务调度与回收策略
 - 更细的持久化一致性模型

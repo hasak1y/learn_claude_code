@@ -35,6 +35,7 @@ from .session_log import SessionLogger
 from .task_graph import TaskGraphManager, TaskNode
 from .tools.base import ToolRegistry
 from .types import AgentRunResult, ConversationMessage, ToolCall
+from .worktree import WorktreeManager, WorktreeRecord
 
 
 TeamAgentStatus = Literal["idle", "working", "shutdown"]
@@ -44,12 +45,14 @@ ProtocolAction = Literal[
     "shutdown_request",
     "handoff_request",
     "ack_request",
+    "integration_request",
 ]
 RequestStatus = Literal[
     "pending",
     "acknowledged",
     "approved",
     "rejected",
+    "changes_requested",
     "completed",
     "cancelled",
     "failed",
@@ -535,9 +538,44 @@ class TeamManager:
     ) -> str:
         """创建一条需要明确状态追踪的协议请求。"""
 
+        try:
+            record = self.create_request_record(
+                sender=sender,
+                recipient=recipient,
+                action=action,
+                summary=summary,
+                content=content,
+            )
+        except ValueError as exc:
+            return f"错误：{exc}"
+
+        self._write_config()
+        return (
+            "已创建 protocol request：\n"
+            f"- request_id: {record.request_id}\n"
+            f"- action: {action}\n"
+            f"- from: {sender}\n"
+            f"- to: {recipient}\n"
+            f"- status: pending"
+        )
+
+    def create_request_record(
+        self,
+        *,
+        sender: str,
+        recipient: str,
+        action: ProtocolAction,
+        summary: str,
+        content: str,
+    ) -> RequestRecord:
+        """创建请求记录并投递 protocol envelope。
+
+        这个 helper 给内部代码用，避免工具层去解析人类可读字符串拿 request_id。
+        """
+
         validation_error = self._validate_sender_and_recipient(sender=sender, recipient=recipient)
         if validation_error is not None:
-            return validation_error
+            raise ValueError(validation_error.removeprefix("错误："))
 
         request_id = f"req-{self._next_request_id:04d}"
         self._next_request_id += 1
@@ -568,15 +606,7 @@ class TeamManager:
                 created_at=now,
             )
         )
-        self._write_config()
-        return (
-            "已创建 protocol request：\n"
-            f"- request_id: {request_id}\n"
-            f"- action: {action}\n"
-            f"- from: {sender}\n"
-            f"- to: {recipient}\n"
-            f"- status: pending"
-        )
+        return record
 
     def respond_request(
         self,
@@ -912,10 +942,11 @@ class TeamManager:
         """校验请求状态迁移是否合法。"""
 
         allowed: dict[RequestStatus, set[RequestStatus]] = {
-            "pending": {"acknowledged", "approved", "rejected", "completed", "cancelled", "failed"},
-            "acknowledged": {"approved", "rejected", "completed", "cancelled", "failed"},
+            "pending": {"acknowledged", "approved", "rejected", "changes_requested", "completed", "cancelled", "failed"},
+            "acknowledged": {"approved", "rejected", "changes_requested", "completed", "cancelled", "failed"},
             "approved": {"completed", "failed", "cancelled"},
             "rejected": set(),
+            "changes_requested": {"approved", "rejected", "completed", "cancelled", "failed"},
             "completed": set(),
             "cancelled": set(),
             "failed": set(),
@@ -998,9 +1029,10 @@ class TeamAgentRunner:
 
     team_manager: TeamManager
     llm_client_factory: Callable[[], BaseLLMClient]
-    tool_registry_factory: Callable[[str], ToolRegistry]
-    base_system_prompt_builder: Callable[[str], str]
+    tool_registry_factory: Callable[[str, str | None], ToolRegistry]
+    base_system_prompt_builder: Callable[[str, str | None], str]
     task_graph_manager: TaskGraphManager | None = None
+    worktree_manager: WorktreeManager | None = None
     startup_messages: list[ConversationMessage] | None = None
     max_steps: int = 8
     max_auto_claims_per_run: int = 1
@@ -1038,12 +1070,15 @@ class TeamAgentRunner:
         auto_claim_count = 0
         reply_senders: set[str] = set()
         last_run_result: AgentRunResult | None = None
+        claimed_task_ids: list[int] = []
         try:
-            system_prompt = self.team_manager.build_agent_system_prompt(
-                agent_id=agent_id,
-                base_prompt=self.base_system_prompt_builder(agent_id),
-            )
             while True:
+                workspace_record = self._resolve_workspace_for_agent(agent)
+                workspace_cwd = workspace_record.path if workspace_record is not None else None
+                system_prompt = self.team_manager.build_agent_system_prompt(
+                    agent_id=agent_id,
+                    base_prompt=self.base_system_prompt_builder(agent_id, workspace_cwd),
+                )
                 inbox_items = self.team_manager.drain_inbox(agent_id)
                 if inbox_items:
                     processed_inbox_items += len(inbox_items)
@@ -1076,17 +1111,32 @@ class TeamAgentRunner:
                             return f"Agent '{agent_id}' 的 inbox 为空，且当前没有可自动认领的任务。"
                         break
 
+                    workspace_record = self._ensure_worktree_for_task(
+                        task=auto_task,
+                        agent=agent,
+                    )
+                    workspace_cwd = workspace_record.path if workspace_record is not None else None
+                    system_prompt = self.team_manager.build_agent_system_prompt(
+                        agent_id=agent_id,
+                        base_prompt=self.base_system_prompt_builder(agent_id, workspace_cwd),
+                    )
+
                     auto_claim_count += 1
+                    claimed_task_ids.append(auto_task.id)
                     auto_message = ConversationMessage(
                         role="user",
-                        content=self._build_auto_claim_message(task=auto_task, agent=agent),
+                        content=self._build_auto_claim_message(
+                            task=auto_task,
+                            agent=agent,
+                            workspace_record=workspace_record,
+                        ),
                     )
                     history.append(auto_message)
                     session_logger.append_message(auto_message, scope=f"team:{agent_id}:auto_claim")
 
                 last_run_result = AgentLoop(
                     llm_client=self.llm_client_factory(),
-                    tool_registry=self.tool_registry_factory(agent_id),
+                    tool_registry=self.tool_registry_factory(agent_id, workspace_cwd),
                     system_prompt=system_prompt,
                     max_steps=self.max_steps,
                     echo_tool_calls=False,
@@ -1121,6 +1171,16 @@ class TeamAgentRunner:
             steps=0,
             last_message=None,
         )
+        reconciliation_notes = self._reconcile_claimed_tasks(claimed_task_ids)
+        if reconciliation_notes:
+            note_block = "\n".join(f"- {note}" for note in reconciliation_notes)
+            run_result = AgentRunResult(
+                status=run_result.status,
+                final_text=f"{run_result.final_text}\n\n[一致性校验]\n{note_block}",
+                steps=run_result.steps,
+                last_message=run_result.last_message,
+                error=run_result.error,
+            )
         for sender in sorted(reply_senders):
             self.team_manager.send_message(
                 sender=agent_id,
@@ -1146,6 +1206,50 @@ class TeamAgentRunner:
             f"结果摘要：\n{run_result.final_text}"
         )
 
+    def _reconcile_claimed_tasks(self, task_ids: list[int]) -> list[str]:
+        """在 teammate 运行后做最小一致性校验。
+
+        目标是防止“worktree 中只是形成了候选改动，但任务却被写成 completed”。
+        这种错误在多工作区模式下尤其危险，因为主仓库里可能根本还没有该文件。
+        """
+
+        if self.task_graph_manager is None or self.worktree_manager is None:
+            return []
+
+        notes: list[str] = []
+        for task_id in task_ids:
+            try:
+                task = self.task_graph_manager.get_node(task_id)
+            except ValueError:
+                continue
+
+            record = self.worktree_manager.get_record(task_id)
+            if record is None or task.status != "completed":
+                continue
+
+            if record.status == "integrated":
+                continue
+
+            target_status = (
+                "integration_pending"
+                if record.status in {"review_pending", "approved"}
+                else "pending"
+            )
+            result = self.task_graph_manager.update(
+                task_id=task_id,
+                base_version=task.version,
+                status=target_status,
+            )
+            if result.startswith("错误："):
+                notes.append(f"task {task_id} 状态回退失败：{result}")
+                continue
+            notes.append(
+                f"task {task_id} 原本被误标为 completed，但对应 worktree 状态是 {record.status}；"
+                f"已自动回退为 {target_status}。"
+            )
+
+        return notes
+
     def _claim_next_task(self, agent: TeamAgentRecord) -> TaskNode | None:
         """在允许自治时，为 teammate 认领下一项匹配自己角色的 ready 任务。"""
 
@@ -1162,20 +1266,74 @@ class TeamAgentRunner:
             agent_role=agent.role,
         )
 
+    def _resolve_workspace_for_agent(self, agent: TeamAgentRecord) -> WorktreeRecord | None:
+        """根据当前活动任务解析该 agent 应该工作的目录。"""
+
+        if self.task_graph_manager is None or self.worktree_manager is None:
+            return None
+
+        active_task = self.task_graph_manager.get_claimed_task_for_agent(agent.agent_id)
+        if active_task is None:
+            return None
+
+        try:
+            return self.worktree_manager.ensure_worktree(
+                task_id=active_task.id,
+                agent_id=agent.agent_id,
+                task_subject=active_task.subject,
+            )
+        except RuntimeError:
+            # 这里不直接打断 teammate；没有 worktree 时仍可退回主仓库执行，
+            # 只是失去目录隔离能力。
+            return None
+
+    def _ensure_worktree_for_task(
+        self,
+        *,
+        task: TaskNode,
+        agent: TeamAgentRecord,
+    ) -> WorktreeRecord | None:
+        """为自动认领的任务创建或复用 worktree。"""
+
+        if self.worktree_manager is None:
+            return None
+
+        try:
+            return self.worktree_manager.ensure_worktree(
+                task_id=task.id,
+                agent_id=agent.agent_id,
+                task_subject=task.subject,
+            )
+        except RuntimeError:
+            return None
+
     @staticmethod
-    def _build_auto_claim_message(task: TaskNode, agent: TeamAgentRecord) -> str:
+    def _build_auto_claim_message(
+        task: TaskNode,
+        agent: TeamAgentRecord,
+        workspace_record: WorktreeRecord | None,
+    ) -> str:
         """把自动认领的任务包装成注入上下文的内部消息。"""
 
+        workspace_block = (
+            f"workspace_path: {workspace_record.path}\n"
+            f"workspace_branch: {workspace_record.branch}\n"
+            if workspace_record is not None
+            else "workspace_path: （未分配，回退到主仓库目录）\n"
+        )
         return (
             "<auto_claimed_task>\n"
             f"task_id: {task.id}\n"
             f"subject: {task.subject}\n"
             f"owner_hint: {task.owner or '（无）'}\n"
             f"claimed_by: {task.claimed_by}\n"
+            f"{workspace_block}"
             f"description:\n{task.description or '（无）'}\n\n"
             "这是你在空闲状态下自动认领的一项 ready 任务。"
             "你可以使用 task_get 查看完整任务信息。更新状态前先读取最新 version，"
-            "然后把 base_version 一起带给 task_update，再把任务更新为 completed。"
+            "然后把 base_version 一起带给 task_update。"
+            "如果改动只是先提交给 lead 审查，应进入 integration_pending；"
+            "只有真正集成回主线后，任务才算 completed。"
             "</auto_claimed_task>"
         )
 

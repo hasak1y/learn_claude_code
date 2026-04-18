@@ -7,11 +7,15 @@
 - `ready` / `blocked` 是运行时派生状态，不单独落盘
 - `version` 用于乐观并发控制，避免多个 Agent 相互覆盖更新
 - 锁文件 + 原子写回用于降低 claim / update / create 的竞争风险
+- `createdInSession` / `taskBatchId` 用于表达任务来自哪个会话批次
+- 新会话启动时，旧会话遗留的活跃任务默认会被转成 `abandoned`
 
 这样运行时可以稳定回答：
 - 什么可以做
 - 什么被卡住
-- 什么做完了
+- 什么已经完成
+- 什么被用户取消
+- 什么只是旧会话遗留、当前默认不继续
 - 这条任务有没有被别人先改过
 """
 
@@ -26,7 +30,14 @@ from pathlib import Path
 from typing import Literal
 
 
-TaskStatus = Literal["pending", "in_progress", "completed"]
+TaskStatus = Literal[
+    "pending",
+    "in_progress",
+    "integration_pending",
+    "completed",
+    "cancelled",
+    "abandoned",
+]
 
 
 @dataclass(slots=True)
@@ -42,6 +53,8 @@ class TaskNode:
     version: int
     claimed_by: str
     claimed_at: float | None
+    created_in_session: str
+    task_batch_id: str
     created_at: float
     updated_at: float
 
@@ -58,6 +71,8 @@ class TaskNode:
             "version": self.version,
             "claimedBy": self.claimed_by,
             "claimedAt": self.claimed_at,
+            "createdInSession": self.created_in_session,
+            "taskBatchId": self.task_batch_id,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
@@ -78,19 +93,38 @@ class TaskNode:
             claimed_at=(
                 float(data.get("claimedAt")) if data.get("claimedAt") is not None else None
             ),
+            created_in_session=str(data.get("createdInSession", "")),
+            task_batch_id=str(data.get("taskBatchId", "")),
             created_at=float(data.get("createdAt", time.time())),
             updated_at=float(data.get("updatedAt", time.time())),
         )
 
 
 class TaskGraphManager:
-    """管理 `.tasks/` 目录下的持久化任务图。"""
+    """管理 `.tasks/` 目录下的持久化任务图。
+
+    这层既负责任务依赖和 claim，也负责跨会话的最小生命周期语义：
+    - 活跃任务：pending / in_progress / integration_pending
+    - 终态任务：completed / cancelled / abandoned
+    """
 
     def __init__(self, tasks_dir: Path) -> None:
         self.dir = tasks_dir
         self.dir.mkdir(parents=True, exist_ok=True)
         self._locks_dir = self.dir / ".locks"
         self._locks_dir.mkdir(parents=True, exist_ok=True)
+        self.current_session_id = ""
+        self.current_task_batch_id = ""
+
+    def set_runtime_context(self, *, session_id: str, task_batch_id: str | None = None) -> None:
+        """设置当前运行时上下文，供后续新建任务打上来源标签。
+
+        `session_id` 用来判断“这是不是旧会话遗留任务”，
+        `task_batch_id` 预留给后续更细粒度的一组任务批次恢复。
+        """
+
+        self.current_session_id = session_id
+        self.current_task_batch_id = task_batch_id or session_id
 
     def create(
         self,
@@ -122,6 +156,8 @@ class TaskGraphManager:
                 version=1,
                 claimed_by="",
                 claimed_at=None,
+                created_in_session=self.current_session_id,
+                task_batch_id=self.current_task_batch_id or self.current_session_id,
                 created_at=now,
                 updated_at=now,
             )
@@ -193,15 +229,22 @@ class TaskGraphManager:
 
             if status is not None:
                 normalized_status = str(status).strip()
-                if normalized_status not in {"pending", "in_progress", "completed"}:
+                if normalized_status not in {
+                    "pending",
+                    "in_progress",
+                    "integration_pending",
+                    "completed",
+                    "cancelled",
+                    "abandoned",
+                }:
                     return f"错误：非法状态：{status}"
                 try:
                     self._validate_status_transition(task, normalized_status)
                 except ValueError as exc:
                     return f"错误：{exc}"
                 task.status = normalized_status  # type: ignore[assignment]
-                if normalized_status in {"pending", "completed"}:
-                    # 退回 pending 或进入 completed 时，自动清理 claim。
+                if normalized_status in {"pending", "integration_pending", "completed", "cancelled", "abandoned"}:
+                    # 退回 pending、进入 review 待集成或真正完成时，自动清理 claim。
                     task.claimed_by = ""
                     task.claimed_at = None
 
@@ -282,6 +325,83 @@ class TaskGraphManager:
 
         return self._format_task(task)
 
+    def get_node(self, task_id: int) -> TaskNode:
+        """返回结构化任务节点，供内部控制层读取最新版本。"""
+
+        return self._load(task_id)
+
+    def abandon_stale_tasks(self, *, current_session_id: str) -> str:
+        """把旧会话遗留的活跃任务标记为 abandoned。
+
+        这层解决的是“上次跑到一半，这次默认不要自动续跑”。
+        真正需要继续时，应由显式恢复动作把任务拉回 pending / in_progress。
+        """
+
+        changed: list[str] = []
+        for task in self._all_tasks():
+            if task.status not in {"pending", "in_progress", "integration_pending"}:
+                continue
+            if task.created_in_session == current_session_id:
+                continue
+
+            with self._lock_task(task.id):
+                latest = self._load(task.id)
+                if latest.status not in {"pending", "in_progress", "integration_pending"}:
+                    continue
+                if latest.created_in_session == current_session_id:
+                    continue
+
+                latest.status = "abandoned"
+                latest.claimed_by = ""
+                latest.claimed_at = None
+                latest.version += 1
+                latest.updated_at = time.time()
+                self._save(latest)
+                changed.append(f"task {latest.id}: {latest.subject}")
+
+        if not changed:
+            return "没有需要失活的旧任务。"
+        return "已将旧会话遗留任务标记为 abandoned：\n- " + "\n- ".join(changed)
+
+    def restore_tasks(
+        self,
+        *,
+        task_ids: list[int],
+        status: str = "pending",
+    ) -> str:
+        """显式恢复 abandoned / cancelled 任务。"""
+
+        normalized_status = status.strip()
+        if normalized_status not in {"pending", "in_progress"}:
+            return "错误：恢复后的状态只能是 pending 或 in_progress"
+
+        results: list[str] = []
+        for task_id in task_ids:
+            with self._lock_task(task_id):
+                try:
+                    task = self._load(task_id)
+                except ValueError as exc:
+                    results.append(f"task {task_id}: {exc}")
+                    continue
+
+                if task.status not in {"abandoned", "cancelled"}:
+                    results.append(f"task {task_id}: 当前状态为 {task.status}，不能恢复")
+                    continue
+
+                if normalized_status == "in_progress" and self._unmet_dependency_ids(task):
+                    results.append(f"task {task_id}: 仍被依赖阻塞，不能直接恢复为 in_progress")
+                    continue
+
+                task.status = normalized_status  # type: ignore[assignment]
+                task.claimed_by = ""
+                task.claimed_at = None
+                task.version += 1
+                task.updated_at = time.time()
+                self._save(task)
+                results.append(f"task {task_id}: 已恢复为 {normalized_status}")
+
+        return "恢复结果：\n- " + "\n- ".join(results) if results else "没有恢复任何任务。"
+
     def list_ready(self) -> str:
         """列出当前可开始的任务。"""
 
@@ -321,8 +441,25 @@ class TaskGraphManager:
             lines.append(f"- task {task.id}: {task.subject} | version {task.version}")
         return "\n".join(lines)
 
+    def list_abandoned(self) -> str:
+        """列出当前 abandoned 任务。"""
+
+        abandoned = [task for task in self._all_tasks() if task.status == "abandoned"]
+        if not abandoned:
+            return "当前没有 abandoned 任务。"
+
+        lines = ["当前 abandoned 任务："]
+        for task in abandoned:
+            lines.append(f"- task {task.id}: {task.subject} | version {task.version}")
+        return "\n".join(lines)
+
     def list_all(self) -> str:
-        """按分组列出全部任务。"""
+        """按分组列出全部任务。
+
+        这里不仅展示活跃任务，也展示：
+        - `cancelled`：用户明确终止
+        - `abandoned`：旧会话遗留，当前默认不继续
+        """
 
         tasks = self._all_tasks()
         if not tasks:
@@ -332,7 +469,10 @@ class TaskGraphManager:
             "ready": [task for task in tasks if self._effective_status(task) == "ready"],
             "blocked": [task for task in tasks if self._effective_status(task) == "blocked"],
             "in_progress": [task for task in tasks if task.status == "in_progress"],
+            "integration_pending": [task for task in tasks if task.status == "integration_pending"],
             "completed": [task for task in tasks if task.status == "completed"],
+            "cancelled": [task for task in tasks if task.status == "cancelled"],
+            "abandoned": [task for task in tasks if task.status == "abandoned"],
         }
 
         lines = ["当前任务图："]
@@ -348,6 +488,22 @@ class TaskGraphManager:
                 lines.append(f"- task {task.id}: {task.subject}{suffix}")
         return "\n".join(lines)
 
+    def get_claimed_task_for_agent(self, agent_id: str) -> TaskNode | None:
+        """返回某个 Agent 当前正在处理的任务。
+
+        这里的含义是：
+        - 任务状态为 in_progress
+        - 且 claimed_by 就是这个 agent
+
+        worktree 分配会用它来判断：
+        这个 teammate 当前有没有已经绑定的活动任务。
+        """
+
+        for task in self._all_tasks():
+            if task.status == "in_progress" and task.claimed_by == agent_id:
+                return task
+        return None
+
     def render_summary(self) -> str:
         """生成适合提醒和摘要的任务图摘要。"""
 
@@ -358,13 +514,19 @@ class TaskGraphManager:
         ready = [f"task {task.id}" for task in tasks if self._effective_status(task) == "ready"]
         blocked = [f"task {task.id}" for task in tasks if self._effective_status(task) == "blocked"]
         in_progress = [f"task {task.id}" for task in tasks if task.status == "in_progress"]
+        integration_pending = [
+            f"task {task.id}" for task in tasks if task.status == "integration_pending"
+        ]
         completed = [f"task {task.id}" for task in tasks if task.status == "completed"]
+        abandoned = [f"task {task.id}" for task in tasks if task.status == "abandoned"]
 
         return (
             f"ready: {', '.join(ready) if ready else '（无）'}\n"
             f"blocked: {', '.join(blocked) if blocked else '（无）'}\n"
             f"in_progress: {', '.join(in_progress) if in_progress else '（无）'}\n"
-            f"completed: {', '.join(completed) if completed else '（无）'}"
+            f"integration_pending: {', '.join(integration_pending) if integration_pending else '（无）'}\n"
+            f"completed: {', '.join(completed) if completed else '（无）'}\n"
+            f"abandoned: {', '.join(abandoned) if abandoned else '（无）'}"
         )
 
     def has_tasks(self) -> bool:
@@ -514,9 +676,12 @@ class TaskGraphManager:
             return
 
         allowed = {
-            "pending": {"in_progress", "completed"},
-            "in_progress": {"completed", "pending"},
+            "pending": {"in_progress", "completed", "cancelled", "abandoned"},
+            "in_progress": {"integration_pending", "completed", "pending", "cancelled", "abandoned"},
+            "integration_pending": {"in_progress", "completed", "pending", "cancelled", "abandoned"},
             "completed": {"pending"},
+            "cancelled": {"pending"},
+            "abandoned": {"pending", "in_progress"},
         }
         if new_status not in allowed[task.status]:
             raise ValueError(f"不允许从 {task.status} 变更到 {new_status}")
@@ -525,7 +690,11 @@ class TaskGraphManager:
             raise ValueError("当前任务仍被依赖阻塞，不能开始")
 
     def _effective_status(self, task: TaskNode) -> str:
-        """计算派生状态。"""
+        """计算派生状态。
+
+        只有 `pending` 会进一步派生为 `ready / blocked`；
+        其余状态都直接按持久化状态返回。
+        """
 
         if task.status == "pending":
             return "blocked" if self._unmet_dependency_ids(task) else "ready"

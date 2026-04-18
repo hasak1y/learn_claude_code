@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "baidu_search": {
+      "transport": "http",
+      "url": "https://mcpmarket.cn/mcp/5c0958d036dff0e9eb3c3a12",
+      "tools": [
+        "baidu_web_search"
+      ]
+    }
+  }
+}

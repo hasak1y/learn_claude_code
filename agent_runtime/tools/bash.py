@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import locale
 import os
 import subprocess
 
@@ -41,6 +42,28 @@ class ShellTool(BaseTool):
         self.cwd = cwd or os.getcwd()
         self.timeout_seconds = timeout_seconds
 
+    @staticmethod
+    def _decode_output(data: bytes) -> str:
+        """稳妥解码子进程输出。
+
+        Windows 下很多命令默认按本地代码页输出，但也有工具会直接输出 UTF-8。
+        这里先尝试 UTF-8，再回退到系统首选编码，最后用 replace 保底，避免
+        `text=True` 在 reader thread 里提前抛出 UnicodeDecodeError。
+        """
+
+        if not data:
+            return ""
+
+        candidates = ["utf-8", locale.getpreferredencoding(False), "gbk"]
+        for encoding in candidates:
+            if not encoding:
+                continue
+            try:
+                return data.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return data.decode("utf-8", errors="replace")
+
     def execute(self, arguments: dict[str, object]) -> str:
         """执行命令，并返回合并后的 stdout/stderr 文本。"""
 
@@ -60,7 +83,7 @@ class ShellTool(BaseTool):
                 shell=True,
                 cwd=self.cwd,
                 capture_output=True,
-                text=True,
+                text=False,
                 timeout=self.timeout_seconds,
             )
         except subprocess.TimeoutExpired:
@@ -68,7 +91,9 @@ class ShellTool(BaseTool):
         except Exception as exc:  # noqa: BLE001
             return f"错误：命令执行失败: {exc}"
 
-        output = (completed.stdout + completed.stderr).strip()
+        stdout_text = self._decode_output(completed.stdout)
+        stderr_text = self._decode_output(completed.stderr)
+        output = (stdout_text + stderr_text).strip()
         if not output:
             return "（无输出）"
 

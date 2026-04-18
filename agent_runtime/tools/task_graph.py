@@ -90,7 +90,14 @@ class UpdateTaskTool(BaseTool):
             },
             "status": {
                 "type": "string",
-                "enum": ["pending", "in_progress", "completed"],
+                "enum": [
+                    "pending",
+                    "in_progress",
+                    "integration_pending",
+                    "completed",
+                    "cancelled",
+                    "abandoned",
+                ],
                 "description": "任务状态，可选。",
             },
             "add_blocked_by": {
@@ -227,7 +234,10 @@ class ListAllTasksTool(BaseTool):
     """查看全部任务分组。"""
 
     name = "task_list_all"
-    description = "按 ready、blocked、in_progress、completed 分组查看全部任务。"
+    description = (
+        "按 ready、blocked、in_progress、integration_pending、completed、"
+        "cancelled、abandoned 分组查看全部任务。"
+    )
     input_schema = {
         "type": "object",
         "properties": {},
@@ -289,3 +299,62 @@ class ListCompletedTasksTool(BaseTool):
 
     def execute(self, arguments: dict[str, Any]) -> str:
         return self.manager.list_completed()
+
+
+class ListAbandonedTasksTool(BaseTool):
+    """查看当前 abandoned 任务。"""
+
+    name = "task_list_abandoned"
+    description = "查看当前 abandoned 任务。它们默认不会在新会话中继续执行。"
+    input_schema = {
+        "type": "object",
+        "properties": {},
+    }
+
+    def __init__(self, manager: TaskGraphManager) -> None:
+        self.manager = manager
+
+    def execute(self, arguments: dict[str, Any]) -> str:
+        return self.manager.list_abandoned()
+
+
+class RestoreTasksTool(BaseTool):
+    """显式恢复 abandoned / cancelled 任务。"""
+
+    name = "task_restore"
+    description = (
+        "显式恢复 abandoned 或 cancelled 任务。"
+        "适合用户明确要求“继续上次任务”时使用。"
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "task_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "要恢复的任务 id 列表。",
+            },
+            "status": {
+                "type": "string",
+                "enum": ["pending", "in_progress"],
+                "description": "恢复后的目标状态，默认 pending。",
+            },
+        },
+        "required": ["task_ids"],
+    }
+
+    def __init__(self, manager: TaskGraphManager) -> None:
+        self.manager = manager
+
+    def execute(self, arguments: dict[str, Any]) -> str:
+        raw_ids = arguments.get("task_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return "错误：task_ids 必须是非空数组"
+
+        try:
+            task_ids = [int(item) for item in raw_ids]
+        except (TypeError, ValueError):
+            return "错误：task_ids 中的元素必须是整数"
+
+        status = str(arguments.get("status", "pending")).strip() or "pending"
+        return self.manager.restore_tasks(task_ids=task_ids, status=status)

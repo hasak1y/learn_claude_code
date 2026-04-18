@@ -16,6 +16,7 @@ from agent_runtime.dialogue_history import RecentDialogueStore
 from agent_runtime.hooks import HookManager
 from agent_runtime.llm import OpenAICompatibleLLMClient
 from agent_runtime.memory import AutoMemoryManager, LearnClaudeContextLoader
+from agent_runtime.mcp_client import MCPClient, load_mcp_server_configs
 from agent_runtime.runtime_hooks import (
     BackgroundJobHook,
     MemoryRetrievalHook,
@@ -29,6 +30,7 @@ from agent_runtime.task_graph import TaskGraphManager
 from agent_runtime.team import TeamAgentRunner, TeamManager
 from agent_runtime.todo import TodoManager
 from agent_runtime.permissions import PermissionPolicy
+from agent_runtime.worktree import WorktreeManager
 from agent_runtime.tools.background_job import (
     BackgroundShellTool,
     GetBackgroundJobResultTool,
@@ -44,10 +46,12 @@ from agent_runtime.tools.subagent import TaskTool
 from agent_runtime.tools.task_graph import (
     CreateTaskTool,
     GetTaskTool,
+    ListAbandonedTasksTool,
     ListAllTasksTool,
     ListBlockedTasksTool,
     ListCompletedTasksTool,
     ListReadyTasksTool,
+    RestoreTasksTool,
     UpdateTaskTool,
 )
 from agent_runtime.tools.team import (
@@ -64,6 +68,14 @@ from agent_runtime.tools.team import (
     SpawnTeamAgentTool,
 )
 from agent_runtime.tools.todo import TodoTool
+from agent_runtime.tools.worktree import (
+    DecideWorktreeReviewTool,
+    GetWorktreeDiffTool,
+    GetWorktreeRecordTool,
+    IntegrateWorktreeTool,
+    ListWorktreesTool,
+    SubmitWorktreeForReviewTool,
+)
 from agent_runtime.tools.write_file import WriteFileTool
 from agent_runtime.types import ConversationMessage
 
@@ -139,8 +151,11 @@ def build_system_prompt(
         "读取文件时优先使用 read_file。\n"
         "创建或整体覆盖文本文件时优先使用 write_file。\n"
         "修改已有文件时优先使用 edit_file。\n"
+        "如果看到工具名形如 mcp__<server>__<tool>，说明这是来自外部 MCP server 的可插拔工具；它的逻辑名对应 mcp.<server>.<tool>。\n"
         "简单、线性的短任务可使用 todo。\n"
         "存在依赖、解锁关系或可并行推进的复杂任务，应优先使用 task graph 工具。\n"
+        "跨会话时，旧会话遗留的未完成任务默认会被标记为 abandoned，不会自动继续执行。\n"
+        "只有当用户明确要求“继续上次任务”或“恢复之前的任务”时，才使用 task_restore 恢复这些任务。\n"
         "todo 中同一时刻最多只能有一个 in_progress。\n"
         "如果某个 shell 命令预计会运行很久，例如 npm install、pytest 或 docker build，应优先使用 shell_background 把它放到后台，再继续做别的工作。\n"
         "后台任务完成后，结果会在下一次调用模型前自动注入。\n"
@@ -150,6 +165,8 @@ def build_system_prompt(
         "当你需要把任务、备注或结果发给 teammate 时，使用 team_send_message。\n"
         "当你需要发起审批、关机、交接或签收这类需要明确 request_id 和状态追踪的动作时，使用 team_send_protocol。\n"
         "当你收到 protocol request 并需要确认、批准、拒绝或完成时，使用 team_respond_protocol。\n"
+        "当 teammate 完成了独立 worktree 中的候选变更时，优先使用 worktree_get_record / worktree_get_diff 审查，"
+        "再用 worktree_review_decision 做 approved / changes_requested / rejected，最后用 worktree_integrate 把 approved 的改动集成回主线。\n"
         "当前开启了权限审查：敏感操作需要用户确认。\n"
         "长期规则层和长期经验层会通过后续上下文消息注入，而不是直接写死在 system prompt 中。\n"
         "这些都属于外置上下文，不代表模型权重已经学会了它们。\n"
@@ -178,6 +195,7 @@ def build_subagent_system_prompt(
         "读取文件时优先使用 read_file。\n"
         "创建或整体覆盖文本文件时优先使用 write_file。\n"
         "修改已有文件时优先使用 edit_file。\n"
+        "如果看到工具名形如 mcp__<server>__<tool>，说明这是来自外部 MCP server 的可插拔工具；它的逻辑名对应 mcp.<server>.<tool>。\n"
         "必要时可以使用 compact 来收缩上下文。\n"
         "只有在文件类工具不适合时，再退回使用 shell。\n"
     )
@@ -187,21 +205,32 @@ def build_subagent_system_prompt(
 
 def build_team_agent_base_prompt(
     skill_registry: SkillRegistry,
+    workspace_cwd: str | None = None,
 ) -> str:
     """构造持久 teammate 的通用基础提示词。"""
 
+    workspace_line = (
+        f"当前为你分配的独立工作区目录是：{workspace_cwd}。\n"
+        if workspace_cwd
+        else "当前没有独立 worktree 时，默认在主仓库目录中运行。\n"
+    )
     base_prompt = (
         f"你是一个在 {os.getcwd()} 中运行的持久 teammate。\n"
         "你会跨多轮处理自己的 inbox 任务，并保留自己的历史。\n"
+        f"{workspace_line}"
         "需要时使用工具，回答保持简洁。\n"
         "如果需要把结论、阻塞或协作请求发给其他 teammate，请使用 team_send_message。\n"
         "如果需要发起审批、关机、交接或签收这类结构化请求，请使用 team_send_protocol。\n"
         "如果你收到了 protocol request，需要更新其状态时请使用 team_respond_protocol。\n"
         "你可以使用 task_get / task_update / task_list_ready / task_list_all 查看或更新任务图，但不要创建新任务。\n"
+        "旧会话遗留任务默认会变成 abandoned，不会自动续跑；只有在收到明确恢复指令时，才应使用 task_restore 恢复。\n"
         "更新任务前优先先用 task_get 读取最新 version，再把 base_version 带给 task_update，避免覆盖其他 Agent 的更新。\n"
+        "如果你完成了一个可交付改动，应该使用 worktree_submit_for_review 提交候选变更给 lead 审查，而不是直接自行集成。\n"
+        "注意：候选变更提交 review 后，任务应进入 integration_pending；只有真正集成回主线后，任务才算 completed。\n"
         "读取文件时优先使用 read_file。\n"
         "创建或整体覆盖文本文件时优先使用 write_file。\n"
         "修改已有文件时优先使用 edit_file。\n"
+        "如果看到工具名形如 mcp__<server>__<tool>，说明这是来自外部 MCP server 的可插拔工具；它的逻辑名对应 mcp.<server>.<tool>。\n"
         "必要时可以使用 compact 来收缩上下文。\n"
         "只有在文件类工具不适合时，再退回使用 shell。\n"
     )
@@ -271,7 +300,11 @@ def ensure_startup_context_messages(
         existing.add(key)
 
 
-def build_child_tool_registry(skill_registry: SkillRegistry) -> ToolRegistry:
+def build_child_tool_registry(
+    skill_registry: SkillRegistry,
+    *,
+    mcp_client: MCPClient | None = None,
+) -> ToolRegistry:
     """构造一次性子代理使用的工具集合。"""
 
     return ToolRegistry(
@@ -282,7 +315,8 @@ def build_child_tool_registry(skill_registry: SkillRegistry) -> ToolRegistry:
             WriteFileTool(cwd=os.getcwd()),
             EditFileTool(cwd=os.getcwd()),
             ShellTool(cwd=os.getcwd()),
-        ]
+        ],
+        mcp_client=mcp_client,
     )
 
 
@@ -291,9 +325,14 @@ def build_team_agent_tool_registry(
     skill_registry: SkillRegistry,
     team_manager: TeamManager,
     task_graph_manager: TaskGraphManager,
+    worktree_manager: WorktreeManager,
     sender_id: str,
+    workspace_cwd: str | None = None,
+    mcp_client: MCPClient | None = None,
 ) -> ToolRegistry:
     """构造持久 teammate 运行时使用的工具集合。"""
+
+    effective_cwd = workspace_cwd or os.getcwd()
 
     return ToolRegistry(
         [
@@ -310,11 +349,20 @@ def build_team_agent_tool_registry(
             UpdateTaskTool(manager=task_graph_manager),
             ListReadyTasksTool(manager=task_graph_manager),
             ListAllTasksTool(manager=task_graph_manager),
-            ReadFileTool(cwd=os.getcwd()),
-            WriteFileTool(cwd=os.getcwd()),
-            EditFileTool(cwd=os.getcwd()),
-            ShellTool(cwd=os.getcwd()),
-        ]
+            GetWorktreeRecordTool(manager=worktree_manager),
+            GetWorktreeDiffTool(manager=worktree_manager),
+            SubmitWorktreeForReviewTool(
+                worktree_manager=worktree_manager,
+                team_manager=team_manager,
+                task_graph_manager=task_graph_manager,
+                sender_id=sender_id,
+            ),
+            ReadFileTool(cwd=effective_cwd),
+            WriteFileTool(cwd=effective_cwd),
+            EditFileTool(cwd=effective_cwd),
+            ShellTool(cwd=effective_cwd),
+        ],
+        mcp_client=mcp_client,
     )
 
 
@@ -324,9 +372,11 @@ def build_parent_tool_registry(
     subagent_runner: SubagentRunner,
     skill_registry: SkillRegistry,
     task_graph_manager: TaskGraphManager,
+    worktree_manager: WorktreeManager,
     background_job_manager: BackgroundJobManager,
     team_manager: TeamManager,
     team_runner: TeamAgentRunner,
+    mcp_client: MCPClient | None = None,
 ) -> ToolRegistry:
     """构造父 Agent 使用的工具集合。"""
 
@@ -340,6 +390,27 @@ def build_parent_tool_registry(
             ListReadyTasksTool(manager=task_graph_manager),
             ListBlockedTasksTool(manager=task_graph_manager),
             ListCompletedTasksTool(manager=task_graph_manager),
+            ListAbandonedTasksTool(manager=task_graph_manager),
+            RestoreTasksTool(manager=task_graph_manager),
+            ListWorktreesTool(manager=worktree_manager),
+            GetWorktreeRecordTool(manager=worktree_manager),
+            GetWorktreeDiffTool(manager=worktree_manager),
+            SubmitWorktreeForReviewTool(
+                worktree_manager=worktree_manager,
+                team_manager=team_manager,
+                task_graph_manager=task_graph_manager,
+                sender_id="lead",
+            ),
+            DecideWorktreeReviewTool(
+                worktree_manager=worktree_manager,
+                team_manager=team_manager,
+                task_graph_manager=task_graph_manager,
+                sender_id="lead",
+            ),
+            IntegrateWorktreeTool(
+                manager=worktree_manager,
+                task_graph_manager=task_graph_manager,
+            ),
             BackgroundShellTool(manager=background_job_manager),
             ListBackgroundJobsTool(manager=background_job_manager),
             GetBackgroundJobResultTool(manager=background_job_manager),
@@ -361,7 +432,8 @@ def build_parent_tool_registry(
             WriteFileTool(cwd=os.getcwd()),
             EditFileTool(cwd=os.getcwd()),
             ShellTool(cwd=os.getcwd()),
-        ]
+        ],
+        mcp_client=mcp_client,
     )
 
 
@@ -385,13 +457,22 @@ def main() -> None:
     managed_rules_path = Path(managed_rules_path_raw) if managed_rules_path_raw else None
 
     llm_client = OpenAICompatibleLLMClient(config)
-    permission_mode = os.getenv("PERMISSION_MODE", "dev_safe")
+    # 默认提升到 dangerous，本地桌面端主要是可信开发环境；
+    # 真要收紧时仍然可以通过环境变量显式切回 dev_safe / read_only。
+    permission_mode = os.getenv("PERMISSION_MODE", "dangerous")
     permission_policy = PermissionPolicy(mode=permission_mode)  # type: ignore[arg-type]
     skill_registry = SkillRegistry(root=str(cwd / "skills"))
     todo_manager = TodoManager(reminder_threshold=3)
     task_graph_manager = TaskGraphManager(tasks_dir=cwd / ".tasks")
+    worktree_manager = WorktreeManager(
+        repo_root=cwd,
+        registry_root=cwd / ".worktrees",
+        worktree_base_dir=cwd.parent / f"{cwd.name}_worktrees",
+    )
     background_job_manager = BackgroundJobManager(cwd=os.getcwd())
     team_manager = TeamManager(root=cwd / ".team")
+    mcp_server_configs = load_mcp_server_configs(repo_root=cwd)
+    mcp_client = MCPClient(mcp_server_configs) if mcp_server_configs else None
     sessions_dir = cwd / ".sessions"
     resume_result = load_latest_parent_history(
         sessions_dir,
@@ -417,10 +498,12 @@ def main() -> None:
     )
 
     session_id = f"session_{int(time.time() * 1000)}"
+    task_graph_manager.set_runtime_context(session_id=session_id)
     session_logger = SessionLogger(
         session_id=session_id,
         path=sessions_dir / f"{session_id}.jsonl",
     )
+    stale_task_result = task_graph_manager.abandon_stale_tasks(current_session_id=session_id)
 
     # 接近上下文窗口 85% 时自动 compact。
     auto_compact_threshold = max(1, int(config.context_window * 0.85))
@@ -431,7 +514,10 @@ def main() -> None:
 
     subagent_runner = SubagentRunner(
         llm_client_factory=lambda: OpenAICompatibleLLMClient(config),
-        child_tool_registry_factory=lambda: build_child_tool_registry(skill_registry),
+        child_tool_registry_factory=lambda: build_child_tool_registry(
+            skill_registry,
+            mcp_client=mcp_client,
+        ),
         child_system_prompt=build_subagent_system_prompt(skill_registry),
         child_startup_messages=build_startup_context_messages(
             learnclaude_text=learnclaude_text,
@@ -445,14 +531,21 @@ def main() -> None:
     team_runner = TeamAgentRunner(
         team_manager=team_manager,
         llm_client_factory=lambda: OpenAICompatibleLLMClient(config),
-        tool_registry_factory=lambda agent_id: build_team_agent_tool_registry(
+        tool_registry_factory=lambda agent_id, workspace_cwd=None: build_team_agent_tool_registry(
             skill_registry=skill_registry,
             team_manager=team_manager,
             task_graph_manager=task_graph_manager,
+            worktree_manager=worktree_manager,
             sender_id=agent_id,
+            workspace_cwd=workspace_cwd,
+            mcp_client=mcp_client,
         ),
-        base_system_prompt_builder=lambda _agent_id: build_team_agent_base_prompt(skill_registry),
+        base_system_prompt_builder=lambda _agent_id, _workspace_cwd=None: build_team_agent_base_prompt(
+            skill_registry,
+            workspace_cwd=_workspace_cwd,
+        ),
         task_graph_manager=task_graph_manager,
+        worktree_manager=worktree_manager,
         startup_messages=build_startup_context_messages(
             learnclaude_text=learnclaude_text,
             memory_index_slice=memory_index_slice,
@@ -466,9 +559,11 @@ def main() -> None:
         subagent_runner=subagent_runner,
         skill_registry=skill_registry,
         task_graph_manager=task_graph_manager,
+        worktree_manager=worktree_manager,
         background_job_manager=background_job_manager,
         team_manager=team_manager,
         team_runner=team_runner,
+        mcp_client=mcp_client,
     )
 
     hook_manager = HookManager(
@@ -521,11 +616,15 @@ def main() -> None:
         )
     if learnclaude_text:
         print("[learnclaude] 已加载长期规则层。")
+    if mcp_client is not None:
+        print(f"[mcp] 已加载 {len(mcp_server_configs)} 个 MCP server。")
     print(
         "[memory] "
         f"自动 compact 阈值={auto_compact_threshold}，"
         "长期经验将按需检索。"
     )
+    if stale_task_result != "没有需要失活的旧任务。":
+        print(f"[task_graph] {stale_task_result}")
 
     while True:
         try:

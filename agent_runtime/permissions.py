@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import os
+from fnmatch import fnmatchcase
 from dataclasses import dataclass
 from typing import Callable, Literal
 
@@ -37,6 +39,8 @@ class PermissionPolicy:
 
     def __init__(self, mode: PermissionMode = "dev_safe") -> None:
         self.mode = mode
+        self._deny_tool_patterns = self._load_patterns("PERMISSION_DENY_TOOL_PATTERNS")
+        self._allow_tool_patterns = self._load_patterns("PERMISSION_ALLOW_TOOL_PATTERNS")
 
     def evaluate(self, tool_call: ToolCall) -> PermissionCheckResult:
         """按 deny -> mode -> allow -> ask 的顺序进行评估。"""
@@ -60,6 +64,9 @@ class PermissionPolicy:
 
     def _deny_rules(self, tool_call: ToolCall) -> str | None:
         """硬拒绝规则。"""
+
+        if self._matches_tool_name(tool_call.name, self._deny_tool_patterns):
+            return "工具命中硬拒绝规则。"
 
         if tool_call.name in {"shell", "shell_background"}:
             command = str(tool_call.arguments.get("command", "")).lower()
@@ -86,11 +93,24 @@ class PermissionPolicy:
         if self.mode == "read_only":
             if tool_call.name in {"write_file", "edit_file", "shell", "shell_background"}:
                 return "read_only 模式禁止写入或执行 shell。"
+            if self._is_mcp_tool(tool_call.name) and not self._matches_tool_name(
+                tool_call.name,
+                self._allow_tool_patterns,
+            ):
+                return "read_only 模式下，MCP 工具默认不直接执行，除非显式加入允许列表。"
 
         return None
 
     def _allow_rules(self, tool_call: ToolCall) -> str | None:
         """放行规则。"""
+
+        # dangerous 模式的语义是：除了命中硬拒绝规则的操作外，其余默认允许。
+        # 这适合本地全权限开发环境，避免每次 teammate / review / shell 都反复确认。
+        if self.mode == "dangerous":
+            return "dangerous 模式允许该操作。"
+
+        if self._matches_tool_name(tool_call.name, self._allow_tool_patterns):
+            return "工具命中显式允许规则。"
 
         if tool_call.name in {"read_file", "task", "compact", "todo", "task_create", "task_update"}:
             return "工具属于低风险操作。"
@@ -136,6 +156,63 @@ class PermissionPolicy:
             if self.mode == "dangerous":
                 return "dangerous 模式允许后台命令执行。"
 
+        return None
+
+    @staticmethod
+    def _load_patterns(env_name: str) -> tuple[str, ...]:
+        """从环境变量读取工具名匹配规则。
+
+        约定格式：
+        - 逗号分隔
+        - 支持 shell 风格通配符
+        例如：
+        - mcp.github.*
+        - mcp.github.get_*
+        - mcp.figma.*
+        """
+
+        raw = os.getenv(env_name, "").strip()
+        if not raw:
+            return ()
+        return tuple(
+            item.strip()
+            for item in raw.split(",")
+            if item.strip()
+        )
+
+    @staticmethod
+    def _matches_tool_name(tool_name: str, patterns: tuple[str, ...]) -> bool:
+        """判断工具名是否匹配任意一条通配符规则。
+
+        这里同时支持两类写法：
+        - 实际注册给模型的安全名：mcp__github__search_prs
+        - 逻辑上的 canonical 名：mcp.github.search_prs
+        """
+
+        candidates = {tool_name}
+        canonical_name = PermissionPolicy._to_canonical_tool_name(tool_name)
+        if canonical_name:
+            candidates.add(canonical_name)
+        return any(
+            fnmatchcase(candidate, pattern)
+            for pattern in patterns
+            for candidate in candidates
+        )
+
+    @staticmethod
+    def _is_mcp_tool(tool_name: str) -> bool:
+        return tool_name.startswith("mcp.") or tool_name.startswith("mcp__")
+
+    @staticmethod
+    def _to_canonical_tool_name(tool_name: str) -> str | None:
+        """把安全工具名恢复成逻辑工具名，便于权限规则仍按点号书写。"""
+
+        if tool_name.startswith("mcp__"):
+            parts = tool_name.split("__", 2)
+            if len(parts) == 3 and parts[1] and parts[2]:
+                return f"mcp.{parts[1]}.{parts[2]}"
+        if tool_name.startswith("mcp."):
+            return tool_name
         return None
 
 

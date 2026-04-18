@@ -621,6 +621,16 @@ class AgentLoop:
     ) -> AgentRunResult:
         """构造统一的失败结果。"""
 
+        degraded_result = self._maybe_build_tool_backed_result(
+            messages=messages,
+            error=error,
+            steps=steps,
+            runtime_notes=runtime_notes,
+        )
+        if degraded_result is not None:
+            self.runtime_state = "COMPLETED"
+            return degraded_result
+
         self.runtime_state = "FAILED"
         error_text = (
             "运行失败：\n"
@@ -639,6 +649,48 @@ class AgentLoop:
             steps=steps,
             last_message=failure_message,
             error=error.message,
+        )
+
+    def _maybe_build_tool_backed_result(
+        self,
+        *,
+        messages: list[ConversationMessage],
+        error: RuntimeErrorInfo,
+        steps: int,
+        runtime_notes: list[str],
+    ) -> AgentRunResult | None:
+        """在“工具已成功执行，但收尾 LLM 失败”时做保守降级。
+
+        典型场景：
+        - MCP 搜索工具已经返回结果
+        - 主循环准备再调用一次 LLM 去总结或润色
+        - 上游模型服务 503 / overload
+
+        这时与其把整轮直接判成 fatal，更合理的是把最近一次 tool 输出直接交给用户，
+        同时附带运行时提示，明确说明失败发生在收尾阶段。
+        """
+
+        if error.stage != "llm":
+            return None
+        if not messages:
+            return None
+
+        last_message = messages[-1]
+        if last_message.role != "tool":
+            return None
+
+        self._record_runtime_note(
+            runtime_notes,
+            f"工具结果已成功取得，但后续 LLM 收尾失败，已直接返回最近一次工具输出：{error.message}",
+        )
+        fallback_text = self._compose_final_text(last_message.content, runtime_notes)
+        final_message = ConversationMessage(role="assistant", content=fallback_text)
+        self._append_message(messages, final_message)
+        return AgentRunResult(
+            status="completed",
+            final_text=fallback_text,
+            steps=steps,
+            last_message=final_message,
         )
 
     def _build_terminal_result(

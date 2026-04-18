@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import locale
 import os
 import queue
 import subprocess
@@ -65,6 +66,23 @@ class BackgroundJobManager:
         self._lock = threading.Lock()
         self._completed_events: queue.Queue[BackgroundJobEvent] = queue.Queue()
         self._id_counter = count(1)
+
+    @staticmethod
+    def _decode_output(data: bytes) -> str:
+        """稳妥解码后台子进程输出，避免系统默认编码不匹配时直接崩溃。"""
+
+        if not data:
+            return ""
+
+        candidates = ["utf-8", locale.getpreferredencoding(False), "gbk"]
+        for encoding in candidates:
+            if not encoding:
+                continue
+            try:
+                return data.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return data.decode("utf-8", errors="replace")
 
     def spawn_shell(self, command: str) -> str:
         """启动一个后台 shell 任务，并立即返回 job_id。"""
@@ -174,10 +192,12 @@ class BackgroundJobManager:
                 shell=True,
                 cwd=cwd,
                 capture_output=True,
-                text=True,
+                text=False,
                 timeout=self.timeout_seconds,
             )
-            raw_output = (completed.stdout + completed.stderr).strip() or "（无输出）"
+            stdout_text = self._decode_output(completed.stdout)
+            stderr_text = self._decode_output(completed.stderr)
+            raw_output = (stdout_text + stderr_text).strip() or "（无输出）"
             output = raw_output[:50000]
             status: BackgroundJobStatus = "completed" if completed.returncode == 0 else "failed"
             error = None if completed.returncode == 0 else f"退出码：{completed.returncode}"
