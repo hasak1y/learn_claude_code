@@ -1,45 +1,302 @@
-# 最小 Agent 运行时
+# Learn Claude Code
 
-这个项目是一个面向 Claude Code 风格 Agent 的最小起点，重点不是一开始就做全功能，而是先把最核心的运行时骨架搭起来，并且保证后续容易扩展。
+一个面向 Claude Code 风格的本地 Agent Runtime。
 
-第一版只关注这条核心链路：
+这个项目的目标不是复刻某个现成框架，而是把一个可持续扩展的 agent 运行时拆成几块清晰的能力：
+
+- 主循环
+- 工具调用
+- 记忆系统
+- 子代理与 teammate
+- 权限与 hook
+- 恢复与压缩
+
+它目前已经能跑一个可交互的本地 coding agent，并且支持多轮会话、长期规则、长期经验、持久 teammate 和最小协议层。
+
+## 整体结构
+
+程序入口在 [main.py](E:\github\learn_claude_code\main.py)。
+
+运行时核心都放在 [agent_runtime](E:\github\learn_claude_code\agent_runtime)：
+
+- [agent.py](E:\github\learn_claude_code\agent_runtime\agent.py)
+  主 AgentLoop，负责一轮轮推进、调用模型、执行工具、回填结果。
+- [llm/openai_compatible.py](E:\github\learn_claude_code\agent_runtime\llm\openai_compatible.py)
+  OpenAI-compatible 适配层。
+- [tools](E:\github\learn_claude_code\agent_runtime\tools)
+  所有工具定义。
+- [memory.py](E:\github\learn_claude_code\agent_runtime\memory.py)
+  长期规则、长期经验、自动记忆写入与按需检索。
+- [team.py](E:\github\learn_claude_code\agent_runtime\team.py)
+  持久 teammate、inbox、请求追踪和协议层。
+- [subagents.py](E:\github\learn_claude_code\agent_runtime\subagents.py)
+  一次性 fresh-context 子代理。
+- [runtime_hooks.py](E:\github\learn_claude_code\agent_runtime\runtime_hooks.py)
+  后台任务、memory retrieval、路径规则、权限等横切逻辑。
+- [recovery.py](E:\github\learn_claude_code\agent_runtime\recovery.py)
+  错误分类与恢复决策。
+- [compaction.py](E:\github\learn_claude_code\agent_runtime\compaction.py)
+  上下文压缩。
+
+## 运行模型
+
+主循环大致是：
 
 1. 接收用户输入
-2. 把消息历史和工具定义发送给 LLM
-3. 让 LLM 自己判断是否需要调用工具
-4. 执行工具
-5. 把工具结果回填给 LLM
-6. 重复以上过程，直到 LLM 不再请求工具
+2. 构建本轮上下文
+3. 调用 LLM
+4. 如果模型请求工具，就执行工具并回填结果
+5. 重复，直到得到最终回答
 
-## 当前范围
+这不是单纯的“prompt + tools”，而是一个有状态的 runtime。当前已经内置：
 
-- 一个可复用的 Agent 循环
-- 一个 OpenAI-compatible LLM 适配器
-- 一个 `shell` 工具
-- 一组后台任务工具
-- 一个 `todo` 工具
-- 一组 `task_*` 任务图工具
-- 一个 `compact` 工具
-- 一个 `load_skill` 工具
-- 一个 `read_file` 工具
-- 一个 `write_file` 工具
-- 一个 `edit_file` 工具
-- 一个父 Agent 专属的 `task` 子代理工具
-- 一个命令行入口
-- 一个本地 `skills/` 目录
-- 一个本地 `.transcripts/` 历史转储目录
-- 一个本地 `.sessions/` 追加会话日志目录
-- 一个本地 `.tasks/` 持久化任务图目录
+- 会话恢复
+- 自动 compact
+- 权限审查
+- hook
+- 错误恢复
 
-当前有意不实现的部分：
+## 记忆系统
 
-- 持久工作目录
-- 完整的沙箱 / 权限系统
-- 更强的异常恢复能力
-- 流式 UI
-- OpenAI-compatible 之外的多厂商适配器
+项目现在采用分层记忆，不把所有内容混成一坨 prompt。
 
-## 项目结构
+### 1. 长期规则层
+
+规则文件统一使用：
+
+- `learnclaude.md`
+- `learnclaude.local.md`
+
+它们属于外置上下文，不代表模型“学会了”这些内容。加载方式是按层拼接，然后作为启动上下文注入。
+
+### 2. 长期经验层
+
+长期经验放在：
+
+```text
+.memory/
+  MEMORY.md
+  topics/*.md
+```
+
+- `MEMORY.md` 是索引
+- `topics/*.md` 是正文
+
+系统会按需检索相关 topic，而不是每轮全量加载全部经验。
+
+### 3. 会话记忆
+
+主会话日志放在：
+
+```text
+.sessions/*.jsonl
+```
+
+启动时会从最近一次主会话恢复，默认只恢复最近窗口；如果有 compact 摘要，则优先使用“摘要 + 最近消息”的恢复模式。
+
+### 4. 最近原始对话
+
+最近未压缩的 `user / assistant` 对话会单独写到：
+
+```text
+.chat_history/recent_dialogue.jsonl
+```
+
+这层不参与主会话恢复，主要服务于自动记忆提取。
+
+## 自动记忆
+
+系统会在主回合结束后，基于最近对话和当前 memory 索引，尝试提取长期偏好或长期经验。
+
+这一步不是盲目写入，而是会先做：
+
+- normalize
+- merge
+- topic 复用
+
+目标是避免同义内容被写成一堆碎片文件。
+
+## Team 与 Subagent
+
+项目里有两种“代理协作”方式。
+
+### Subagent
+
+`task` 对应的是一次性子代理：
+
+- fresh context
+- 同步运行
+- 跑完就把结果返回给父 Agent
+
+适合独立的小任务。
+
+### Teammate
+
+teammate 是持久 agent：
+
+- 有固定 `agent_id`
+- 有独立历史
+- 有独立 inbox
+- 可以跨多轮存活
+
+team 相关状态都放在：
+
+```text
+.team/
+  agents/
+  inbox/
+  requests/
+  history/
+  sessions/
+  config.json
+```
+
+## 受限自治
+
+当前没有做“完全自治”的 teammate。
+
+现在实现的是更保守的版本：
+
+- teammate 可以持久化
+- teammate 可以基于自己的角色自动认领任务
+- 但只能从现有 task graph 里拉取任务
+- 不能自己发明新任务
+- 也不会无视显式消息和协议请求
+
+### 触发条件
+
+只有同时满足这些条件时，teammate 才会自动认领任务：
+
+- `auto_pull_tasks = true`
+- 当前 inbox 为空
+- 当前没有待处理 protocol request
+- task graph 中存在匹配自己角色的 ready task
+- 该任务尚未被其他 teammate 认领
+
+### 角色匹配
+
+当前任务是否允许某个 teammate 认领，使用现有任务字段 `owner` 作为最小路由提示：
+
+- `owner` 为空：任何角色都可以认领
+- `owner == agent_id`：只有指定 teammate 可以认领
+- `owner == role`：只有对应角色可以认领
+
+### 任务认领
+
+当前任务图新增了最小 claim 信息：
+
+- `claimed_by`
+- `claimed_at`
+
+当 teammate 自动认领任务时：
+
+- 任务会被标记为 `in_progress`
+- `claimed_by` 会写成当前 `agent_id`
+- 其他 teammate 不会再认领同一项任务
+
+这意味着现在做的不是“自由自治规划”，而是“带角色边界和 claim 保护的持久 worker 模式”。
+
+## Team 协议层
+
+现在的 team 通信分成两层。
+
+### 普通消息
+
+适合：
+
+- 讨论
+- 提醒
+- 补充说明
+
+继续使用：
+
+- `team_send_message`
+
+### 协议消息
+
+适合：
+
+- 审批
+- 关机请求
+- 交接
+- 签收
+
+使用：
+
+- `team_send_protocol`
+- `team_respond_protocol`
+- `team_get_request`
+- `team_list_requests`
+
+每个协议请求都会在 `.team/requests/` 下持久化一份 `RequestRecord`，inbox 只负责投递，状态追踪走请求表。
+
+## Hook 与权限
+
+hook 只承接横切逻辑，不接管主循环。
+
+当前主要 hook 点包括：
+
+- `before_llm_request`
+- `before_tool_execute`
+- `after_tool_execute`
+- `before_compact`
+- `after_compact`
+
+当前已经接入的横切能力主要有：
+
+- 后台任务结果注入
+- memory retrieval
+- 路径规则激活
+- 权限审查
+
+权限系统是最小可用版本，重点是：
+
+- 低风险直接放行
+- 敏感操作要求确认
+- 明显危险操作直接拒绝
+
+## 错误处理与恢复
+
+这套 runtime 现在不是只“捕获异常”，而是已经开始做恢复导向设计。
+
+核心思路是：
+
+- 先分类错误
+- 再决定恢复动作
+- 用运行状态承载恢复过程
+
+当前主循环已经有这些运行状态：
+
+- `RUNNING`
+- `RETRYING`
+- `RESUMING`
+- `COMPACTING`
+- `FAILED`
+- `COMPLETED`
+
+当前恢复动作主要覆盖：
+
+- 临时网络错误重试
+- 上下文溢出后 compact 再继续
+- 非致命工具错误转成步骤级错误继续
+
+## 主要工具
+
+当前父 Agent 侧主要能力包括：
+
+- 文件读写与编辑
+- shell
+- 后台任务
+- todo
+- task graph
+- compact
+- load_skill
+- task
+- team 系列工具
+
+teammate 的工具集会更收敛，只保留适合长期协作的那部分。
+
+## 项目目录
 
 ```text
 main.py
@@ -49,173 +306,23 @@ agent_runtime/
   compaction.py
   config.py
   dialogue_history.py
+  hooks.py
   memory.py
-  team.py
+  permissions.py
+  recovery.py
+  runtime_hooks.py
   session_log.py
   skills.py
   subagents.py
   task_graph.py
+  team.py
   todo.py
   types.py
   llm/
-    base.py
-    openai_compatible.py
   tools/
-    base.py
-    bash.py
-    background_job.py
-    edit_file.py
-    path_utils.py
-    read_file.py
-    skill.py
-    subagent.py
-    task_graph.py
-    todo.py
-    write_file.py
 skills/
-  git/
-    SKILL.md
-  test/
-    SKILL.md
-.memory/
-  MEMORY.md
-  topics/
-.chat_history/
-  recent_dialogue.jsonl
-.team/
-  agents/
-  inbox/
-  requests/
-  history/
-  sessions/
-  config.json
 learnclaude.md
 ```
-
-## Team 协议层
-
-当前的 teammate 协作不再只有普通消息，还额外引入了一层最小 request/response 协议。
-
-### 两层通信模型
-
-1. 普通消息
-- 继续使用 `team_send_message`
-- 适合讨论、提醒、补充说明
-- 仍然走 `.team/inbox/*.jsonl`
-- 类型仍然是 `task / note / result`
-
-2. 协议消息
-- 使用 `team_send_protocol`
-- 适合审批、关机请求、交接、签收
-- 同样投递到 `.team/inbox/*.jsonl`
-- 但载体变成 `ProtocolEnvelope`
-- 每条协议消息都带 `request_id`
-
-### 请求追踪表
-
-每个协议请求都会在：
-
-```text
-.team/requests/<request_id>.json
-```
-
-里保留一份 `RequestRecord`。这层和 inbox 是分开的：
-
-- inbox 负责投递
-- request table 负责追踪状态
-
-也就是说，inbox 被 drain 以后，请求状态不会丢。
-
-### ProtocolEnvelope
-
-投递到 inbox 的结构化协议消息包含这些字段：
-
-- `request_id`
-- `envelope_type`
-- `action`
-- `from`
-- `to`
-- `summary`
-- `content`
-- `response_status`
-- `created_at`
-
-当前 `action` 枚举：
-
-- `approval_request`
-- `shutdown_request`
-- `handoff_request`
-- `ack_request`
-
-当前 `envelope_type` 枚举：
-
-- `request`
-- `response`
-
-### RequestRecord 状态机
-
-当前请求状态枚举：
-
-- `pending`
-- `acknowledged`
-- `approved`
-- `rejected`
-- `completed`
-- `cancelled`
-- `failed`
-
-最小状态迁移规则：
-
-- `pending -> acknowledged / approved / rejected / completed / cancelled / failed`
-- `acknowledged -> approved / rejected / completed / cancelled / failed`
-- `approved -> completed / failed / cancelled`
-- 其他状态视为终态
-
-### 运行流程
-
-协议请求的最小链路是：
-
-1. 发起方调用 `team_send_protocol`
-2. runtime 创建 `RequestRecord`
-3. runtime 把 `ProtocolEnvelope(request)` 追加到目标 Agent 的 inbox
-4. 目标 Agent 下一轮 `drain_inbox()`
-5. runtime 发现这是 protocol request，就自动把请求从 `pending` 更新为 `acknowledged`
-6. 同时把它包装成 `<protocol_request>...</protocol_request>` 注入 teammate 的上下文
-7. 如果对方决定批准、拒绝、完成或取消，就调用 `team_respond_protocol`
-8. runtime 更新 `RequestRecord`
-9. 如果响应方不是发起方，还会自动往发起方 inbox 投递一条 `ProtocolEnvelope(response)`
-10. 发起方后续可以查看 `.team/requests/*.json`，也可以通过 `team_get_request` / `team_list_requests` 读取状态
-
-### 普通消息与协议消息的边界
-
-当前边界建议：
-
-- 用 `team_send_message`
-  - 讨论
-  - 提醒
-  - 补充说明
-  - 一般性结果回传
-
-- 用 `team_send_protocol`
-  - 审批
-  - 关机请求
-  - 交接
-  - 需要签收或状态追踪的正式动作
-
-### 相关工具
-
-当前 team 相关工具分成两组：
-
-普通消息：
-- `team_send_message`
-- `team_peek_inbox`
-- `team_run_agent`
-
-协议层：
-- `team_send_protocol`
-- `team_respond_protocol`
-- `team_get_request`
-- `team_list_requests`
 
 ## 环境变量
 
@@ -224,19 +331,18 @@ learnclaude.md
 - `LLM_MODEL`
 - `LLM_API_KEY`
 
-可选：
+常用可选项：
 
-- `LLM_BASE_URL`，默认值为 `https://api.openai.com/v1`
-- `LLM_TIMEOUT_SECONDS`，默认值为 `120`
-- `LLM_MAX_TOKENS`，默认值为 `2000`
-- `LLM_TEMPERATURE`，默认值为 `0`
-- `LLM_CONTEXT_WINDOW`，默认值为 `16000`
-- `SESSION_RESUME_MAX_MESSAGES`，默认值为 `40`
-- `RECENT_DIALOGUE_MAX_MESSAGES`，默认值为 `100`
-- `MEMORY_DIALOGUE_LOOKBACK`，默认值为 `24`
-- `LEARNCLAUDE_MANAGED_PATH`，可选，指向组织级 `learnclaude.md`
-
-你也可以在项目根目录放一个本地 `.env` 文件，写入同名配置项。
+- `LLM_BASE_URL`
+- `LLM_TIMEOUT_SECONDS`
+- `LLM_MAX_TOKENS`
+- `LLM_TEMPERATURE`
+- `LLM_CONTEXT_WINDOW`
+- `SESSION_RESUME_MAX_MESSAGES`
+- `RECENT_DIALOGUE_MAX_MESSAGES`
+- `MEMORY_DIALOGUE_LOOKBACK`
+- `LEARNCLAUDE_MANAGED_PATH`
+- `PERMISSION_MODE`
 
 示例：
 
@@ -245,1160 +351,27 @@ LLM_MODEL=gpt-4o-mini
 LLM_API_KEY=your_api_key_here
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_CONTEXT_WINDOW=16000
-```
-
-## 四层记忆系统
-
-当前版本已经把“外置上下文”和“模型学会了”明确分开。
-
-这里的 `learnclaude.md`、`MEMORY.md` 和 topic files 都属于运行时注入或按需加载的外置上下文，
-不是模型参数层面的学习。
-
-### 第 1 层：长期规则层
-
-规则文件统一使用 `learnclaude.md` / `learnclaude.local.md`，不再使用 `CLAUDE.md` 命名。
-
-当前支持的来源：
-
-- managed policy：通过 `LEARNCLAUDE_MANAGED_PATH` 指向组织级规则文件
-- user：`~/.learnclaude/learnclaude.md`
-- project shared：项目树中的 `learnclaude.md`
-- project local：项目树中的 `learnclaude.local.md`
-
-加载顺序：
-
-1. managed
-2. user
-3. 从当前工作目录一路向上找到的 project `learnclaude.md`
-4. 同目录下对应的 `learnclaude.local.md`
-
-规则是“拼接而不是覆盖”：
-
-- 上层目录规则先出现
-- 下层目录规则后出现
-- 同目录里 `learnclaude.local.md` 追加在 `learnclaude.md` 后面
-
-代码位置：
-
-- [agent_runtime/memory.py](E:\github\learn_claude_code\agent_runtime\memory.py) 中的 `LearnClaudeContextLoader`
-- [main.py](E:\github\learn_claude_code\main.py) 中 `build_startup_context_messages(...)`
-
-运行方式：
-
-- 启动时统一收集长期规则层
-- 不再直接拼进 system prompt，而是作为“system prompt 之后的启动上下文消息”注入
-- parent / subagent / teammate 都会收到这层启动上下文
-- 这是原始文本注入，不做结构化解析，不做硬约束执行
-
-### 第 2 层：长期经验层
-
-当前长期经验放在：
-
-```text
-.memory/
-  MEMORY.md
-  topics/
-    *.md
-```
-
-设计原则：
-
-- `MEMORY.md` 只做索引，不直接保存完整经验正文
-- 具体经验正文放在 `topics/*.md`
-- 一条长期经验至少包含：
-  - `name`
-  - `description`
-  - `type`
-  - `path`
-
-当前 `MEMORY.md` 的索引格式是单行结构：
-
-```text
-- path: topics/debugging.md | name: Debugging Notes | type: reference | description: 常见调试路径与注意事项
-```
-
-`topics/*.md` 的正文格式是：
-
-```md
----
-name: Debugging Notes
-description: 常见调试路径与注意事项
-type: reference
----
-
-这里写详细经验内容。
-```
-
-当前支持的 `type` 语义：
-
-- `user`
-- `project`
-- `feedback`
-- `reference`
-
-代码位置：
-
-- [agent_runtime/memory.py](E:\github\learn_claude_code\agent_runtime\memory.py) 中的 `AutoMemoryManager`
-
-### 第 3 层：按需加载层
-
-这一层分成两类。
-
-#### 3.1 长期经验按需检索
-
-这是基于“合理推断”实现的本地版本，不声称等同于任何官方私有细节。
-
-当前流程：
-
-1. 启动时先把 `MEMORY.md` 的前置切片作为启动上下文消息注入
-2. 每轮用户请求前，再读取 `MEMORY.md` 索引摘要
-3. 把“用户当前请求 + 索引摘要”发送给一个单独的检索调用
-4. 检索调用只返回少量最相关的 topic 路径 JSON
-5. 默认最多取 5 个 topic
-6. 读取这些 topic 正文，并作为 request-only memory 注入本轮上下文
-
-当前实现细节：
-
-- 入口 hook：`before_llm_request`
-- 只在最后一条消息是 `user` 时触发
-- 如果 LLM 检索失败，会退回关键词重叠的简单检索
-- 为了避免引入第二套模型配置，当前检索调用复用了主 `llm_client`
-
-代码位置：
-
-- [agent_runtime/runtime_hooks.py](E:\github\learn_claude_code\agent_runtime\runtime_hooks.py) 中的 `MemoryRetrievalHook`
-- [agent_runtime/memory.py](E:\github\learn_claude_code\agent_runtime\memory.py) 中的 `retrieve_for_query(...)`
-
-#### 3.2 path-scoped 规则按访问路径激活
-
-子目录规则不是启动时全量注入，而是在真的访问对应路径后才激活。
-
-当前流程：
-
-1. 用户通过 `read_file` / `write_file` / `edit_file` 访问某个文件
-2. runtime 判断这个文件是否位于当前工作目录下的更深层子目录
-3. 如果该路径沿途存在子目录 `learnclaude.md` / `learnclaude.local.md`
-4. 就把这些规则作为追加消息注入活跃历史
-5. 同一目录在同一进程里只激活一次，避免重复污染上下文
-
-代码位置：
-
-- [agent_runtime/runtime_hooks.py](E:\github\learn_claude_code\agent_runtime\runtime_hooks.py) 中的 `PathScopedRuleHook`
-- [agent_runtime/memory.py](E:\github\learn_claude_code\agent_runtime\memory.py) 中的 `render_path_scoped_for_target(...)`
-
-### 第 4 层：执行控制层
-
-这层和记忆有关，但不等于记忆。
-
-当前仍然独立于记忆系统：
-
-- settings / env 配置
-- hook 系统
-- permission policy
-- model / context window 配置
-
-也就是说：
-
-- `learnclaude.md` 是上下文
-- `MEMORY.md` 是长期经验索引
-- `permissions` / `hooks` / `config` 是执行控制
-
-不要把它们混成同一层。
-
-## 会话记忆与聊天记录
-
-### 会话恢复
-
-主 Agent 的会话恢复仍然基于：
-
-```text
-.sessions/<session_id>.jsonl
-```
-
-当前恢复策略：
-
-- 只恢复最近一个主会话
-- 默认恢复最近窗口
-- 如果最近一次会话里已经存在 `[上下文压缩摘要]`
-  则优先走 `summary_plus_recent`
-
-配置项：
-
-```env
-SESSION_RESUME_MAX_MESSAGES=40
-```
-
-代码位置：
-
-- [agent_runtime/session_log.py](E:\github\learn_claude_code\agent_runtime\session_log.py)
-
-### 最近原始聊天记录
-
-除了 `.sessions/` 之外，当前还额外维护最近未压缩的原始对话：
-
-```text
-.chat_history/recent_dialogue.jsonl
-```
-
-设计目的：
-
-- 只保留最近 `user / assistant` 文本
-- 不记录工具消息
-- 不参与主会话恢复
-- 专门供跨会话自动记忆提取使用
-
-默认配置：
-
-```env
-RECENT_DIALOGUE_MAX_MESSAGES=100
-```
-
-代码位置：
-
-- [agent_runtime/dialogue_history.py](E:\github\learn_claude_code\agent_runtime\dialogue_history.py)
-
-## 自动记忆写入
-
-跨会话自动记忆当前已经接入，但采用的是“索引摘要 + 最近对话”的增量提取方式，
-而不是每轮全量浏览所有原始记忆。
-
-当前流程：
-
-1. 每轮主回复结束后，把本轮 `user / assistant` 原始文本写入 `.chat_history/recent_dialogue.jsonl`
-2. 读取最近 `N` 条原始对话，默认 `24`
-3. 把“现有长期经验索引摘要 + 最近对话”发送给一个记忆提取调用
-4. 提取器决定：
-   - `ignore`
-   - `upsert`
-5. runtime 在真正写入前先做 normalize
-6. runtime 尝试把新候选合并进已有 topic，而不是盲目创建新文件
-7. 最多一次写入 2 条长期经验
-8. 写 topic 文件并重建 `MEMORY.md`
-
-默认配置：
-
-```env
-MEMORY_DIALOGUE_LOOKBACK=24
-```
-
-当前提取目标：
-
-- 稳定的用户偏好
-- 项目级约定
-- 用户纠正过的反馈项
-- 具有复用价值的经验总结
-
-### 自动记忆 normalize 与 merge
-
-为了避免同义偏好被写成多个 topic，当前自动记忆在写入前会先做一层归一化。
-
-当前 normalize 规则：
-
-- `type` 只允许落到 `user / project / feedback / reference`
-- `name` 会尽量收敛到稳定主题名
-- `description` 会压成适合索引检索的单行摘要
-- `path` 会尽量映射到稳定文件路径，而不是每次新建随机名字
-
-当前内置了一些稳定主题映射，例如：
-
-- 回答风格 / 先给结论 / response style
-  统一归到 `User Response Style`
-- hook / 横切 / 主循环边界
-  统一归到 `Hook Boundary`
-- memory / 记忆分层 / 记忆系统设计
-  统一归到 `Memory Layer Design`
-
-当前 merge 规则：
-
-1. 如果新候选和已有 topic 路径相同，直接合并
-2. 如果 `type` 相同且 `name` 相同，优先合并
-3. 如果 `type` 相同且主题 token overlap 足够高，也会合并
-
-正文合并策略：
-
-- 如果新内容已经被旧正文包含，则不重复追加
-- 如果旧正文已经完全包含在新正文里，则直接采用新正文
-- 其他情况会在旧正文后追加一个 `## 增量补充` 小节
-
-这样做的目标不是“改写用户语义”，而是：
-
-- 降低长期经验分裂
-- 保持 topic 名称和路径稳定
-- 提升索引检索命中率
-- 让自动记忆更像增量维护，而不是无限长新文件
-
-当前刻意不做：
-
-- 每轮全量扫描所有 topic 正文
-- 无限增长的单文件 memory
-- 模型自行决定恢复多少原始 session 日志
-- 不受约束的长期记忆写入
-
-代码位置：
-
-- [main.py](E:\github\learn_claude_code\main.py) 中 `maybe_update_from_dialogue(...)` 的调用
-- [agent_runtime/memory.py](E:\github\learn_claude_code\agent_runtime\memory.py) 中的 `maybe_update_from_dialogue(...)`
-
-## 运行方式
-
-```bash
-python main.py
-```
-
-命令行交互约定：
-
-- 直接回车：忽略本次输入，继续等待
-- 输入 `q`、`quit` 或 `exit`：退出会话
-
-## 会话日志
-
-当前项目会在会话开始时创建一个新的：
-
-```text
-.sessions/<session_id>.jsonl
-```
-
-行为：
-
-- 每当新的 `ConversationMessage` 进入会话历史，就会追加写入一行
-- 一行一条消息
-- 当前只做追加，不做恢复、不做索引、不做数据库
-
-这和 `.transcripts/` 的区别是：
-
-- `.sessions/`：全程追加日志，记录平时每条进入历史的消息
-- `.transcripts/`：只在真正 compact 时保存压缩前的完整历史快照
-
-### 主 Agent 启动恢复
-
-当前版本已经接入主 Agent 的最小持久记忆恢复。
-
-恢复来源：
-
-- 默认从 `.sessions/` 下最近修改的一份 `session_*.jsonl` 恢复
-- 只恢复 `scope=parent` 的消息
-
-恢复策略：
-
-- 默认不是全量恢复整段历史，而是只恢复最近窗口
-- 可通过环境变量控制窗口大小：
-
-```env
-SESSION_RESUME_MAX_MESSAGES=40
-```
-
-- 如果最近一次会话里已经存在 `[上下文压缩摘要]`，则优先使用“摘要 + 最近消息”的恢复模式
-- 如果不存在 compact 摘要，则退回为普通的最近窗口恢复
-
-启动时会打印类似提示：
-
-```text
-[session_resume] 已从 session_xxx.jsonl 恢复主历史，模式=summary_plus_recent，共 17 条消息。
-```
-
-当前支持的恢复模式：
-
-- `recent_window`
-- `summary_plus_recent`
-
-当前边界：
-
-- 只恢复最近一个主会话
-- 不提供多会话选择
-- 不让模型自己决定恢复多少原始日志
-- 恢复策略优先由 runtime 规则控制，模型只负责利用已恢复上下文
-
-## 任务图
-
-当前项目已经支持持久化任务图，适合处理有依赖关系或可并行推进的复杂任务。
-
-存储方式：
-
-- 每个任务一个 JSON 文件
-- 文件位置在 `.tasks/task_<id>.json`
-- `blockedBy` 表示静态依赖边，不会因为前置任务完成而被删除
-
-状态与派生语义：
-
-- 持久化状态只存 `pending / in_progress / completed`
-- `ready` 和 `blocked` 是运行时派生状态
-- `pending` 且所有依赖都已完成时，派生状态为 `ready`
-- `pending` 且仍有未完成依赖时，派生状态为 `blocked`
-
-当前任务图工具包括：
-
-- `task_create`
-- `task_update`
-- `task_get`
-- `task_list_all`
-- `task_list_ready`
-- `task_list_blocked`
-- `task_list_completed`
-
-适用建议：
-
-- 简单、线性的短任务：继续用 `todo`
-- 有前置依赖、后续解锁或并行结构的复杂任务：优先用任务图
-
-## 后台任务
-
-当前项目已经支持最小后台任务系统，适合运行长时间 shell 命令。
-
-适用场景：
-
-- `npm install`
-- `pytest`
-- `docker build`
-- 其他预计要跑较久、且结果不必立刻决定下一步的独立命令
-
-当前后台任务工具包括：
-
-- `shell_background`
-- `background_job_list`
-- `background_job_result`
-
-当前实现方式：
-
-- 主线程继续负责 AgentLoop 和 LLM 调用
-- 后台线程负责执行长时间 shell 子进程
-- 任务完成后把结果放入完成队列
-- 主线程在下一次调用 LLM 前统一把完成结果注入历史
-
-当前刻意不做：
-
-- 流式输出
-- 交互式 stdin
-- 会话恢复
-- 持久化后台队列
-
-这意味着它更像“最小 job system”，而不只是一个多线程 shell 包装器。
-
-## 三层压缩
-
-当前项目已经接入三层上下文压缩机制。
-
-### 第一层：micro_compact
-
-这一层在每次调用模型前执行，但不会修改原始历史。
-
-行为：
-
-- 只对“发给模型的请求视图”做轻量压缩
-- 较旧且较长的 `tool` 消息会被替换成短占位摘要
-- 最近若干条工具结果仍保留原文
-
-目标：
-
-- 减少旧工具输出持续污染上下文
-- 又不破坏完整历史，便于后续真正做摘要压缩
-
-### 第二层：auto_compact
-
-当会话估算 token 超过阈值时，运行时会自动触发真正压缩。
-
-行为：
-
-- 先把压缩前的完整历史保存到 `.transcripts/`
-- 再让模型生成结构化续航摘要
-- 最后用“摘要 + 最近若干条真实消息”替换活跃历史
-
-当前默认参数偏向“方便本地测试”：
-
-- 父 Agent 默认 `max_steps = 12`
-- `auto_compact_token_threshold = 12000`
-
-结构化摘要至少包含：
-
-- 当前目标
-- 已完成事项
-- 未完成事项
-- 当前 Todo 状态
-- 当前任务图状态
-- 已加载 Skills
-- 关键文件与修改
-- 关键工具结果
-- 重要约束与风险
-- 最近一次用户要求
-
-### 第三层：manual compact
-
-模型也可以显式调用 `compact` 工具。
-
-行为：
-
-- 与 `auto_compact` 复用同一套压缩逻辑
-- 适合在任务阶段切换、上下文已经明显变长、或模型自己感觉该收束时使用
-
-当前原则：
-
-- `micro_compact` 只压缩请求视图
-- `auto_compact` / `manual compact` 才会真正替换活跃历史
-- 完整历史通过 `.transcripts/` 保存在磁盘上
-
-## 这次踩过的坑
-
-这一节记录的是当前项目在接第三方 OpenAI-compatible 服务时，已经实际踩过并确认过的问题。
-
-### 1. `LLM_BASE_URL` 不一定能随便写根域名
-
-有些服务虽然首页是根域名，例如：
-
-```env
-LLM_BASE_URL=https://mzlone.top
-```
-
-但真正可用的聊天接口仍然是：
-
-```text
-/v1/chat/completions
-```
-
-如果运行时直接拼成 `/chat/completions`，就会和实际服务路径不一致。
-
-当前项目已经兼容这两种写法：
-
-- `LLM_BASE_URL=https://api.openai.com/v1`
-- `LLM_BASE_URL=https://mzlone.top`
-
-运行时最终都会正确访问 `.../v1/chat/completions`。
-
-### 2. 某些中转服务会拦截默认 Python 请求头
-
-这次接入的服务对“默认 Python 请求”有明显的网关拦截行为。
-同样的接口，如果请求头特征不对，可能直接返回：
-
-```text
-HTTP 403
-error code: 1010
-```
-
-当前项目已经在 [openai_compatible.py](E:\github\learn_claude_code\agent_runtime\llm\openai_compatible.py) 里补了默认请求头，尤其是：
-
-- `User-Agent: api-client/3.0`
-
-这个值是参考可正常访问的测试项目对齐出来的。
-
-### 3. 模型名大小写可能严格区分
-
-这次服务里：
-
-- `gpt-5.4` 可用
-- `GPT-5.4` 会失败
-
-也就是说，模型名不能想当然地大小写随便写。
-如果模型名不对，服务端可能返回类似：
-
-```text
-No available channel for model GPT-5.4 ...
-```
-
-当前 `.env` 示例已经改成：
-
-```env
-LLM_MODEL=gpt-5.4
-```
-
-如果你怀疑模型名写错了，优先去服务端的模型列表接口核对，不要凭感觉填写。
-
-### 4. 普通聊天时不要发送空工具定义
-
-有些 OpenAI-compatible 服务对下面这种请求兼容性不好：
-
-```json
-{
-  "tools": [],
-  "tool_choice": "auto"
-}
-```
-
-即使你只是想发一个普通聊天请求，也可能因此失败。
-
-当前运行时已经改成：
-
-- 只有在确实存在工具时，才发送 `tools`
-- 没有工具时，不发送 `tools` 和 `tool_choice`
-
-### 5. 某些服务返回 `tool_calls: null`
-
-标准兼容接口里，“没有工具调用”可能返回：
-
-```json
-"tool_calls": null
-```
-
-而不是空数组 `[]`。
-
-如果代码只按列表处理，就会在解析响应时崩掉。
-当前运行时已经兼容：
-
-- `tool_calls: null`
-- `tool_calls: []`
-
-### 6. 包内模块不能直接当脚本运行
-
-像下面这个文件：
-
-- [openai_compatible.py](E:\github\learn_claude_code\agent_runtime\llm\openai_compatible.py)
-
-它是包内模块，不是程序入口。
-如果直接运行这个文件，会因为相对导入而报错。
-
-正确入口是：
-
-```bash
-python main.py
-```
-
-如果只是想检查配置和接口，不要直接跑底层模块，建议单独写最小请求脚本或直接用你已有的 API 测试项目验证。
-
-## 为什么这样拆
-
-这个项目最关键的设计选择，是把下面三件事拆开：
-
-- 循环层负责控制流程
-- LLM 适配层负责和模型提供方通信
-- 工具注册表负责执行工具
-
-这样拆开之后，后面继续加功能会顺很多，比如：
-
-- 增加 Anthropic 适配器
-- 增加更多工具
-- 增加持久化状态
-- 增加文件编辑类工具
-- 增加审批和安全层
-- 增加真正的终端或 Web UI
-
-## 后续规划
-
-### Todo 与任务图提醒机制
-
-当前项目已经支持 `todo` 和任务图两种任务跟踪方式。
-
-设计约束如下：
-
-- `todo` 工具每次提交的是完整清单，而不是局部 patch
-- 同一时刻最多只能有一个 `in_progress`
-- Agent 会在内存中维护当前 todo 状态
-- 复杂任务如果存在依赖关系，应优先使用任务图
-- 如果模型连续多轮没有更新任何任务跟踪信息，运行时会临时注入 reminder
-
-当前 reminder 机制是轻量的：
-
-- 只在调用模型前临时注入
-- 不会把 reminder 永久写入正式对话历史
-- reminder 文本里会附带当前 todo 状态和任务图摘要
-
-当前会被视为“已更新任务跟踪”的操作包括：
-
-- `todo`
-- `task_create`
-- `task_update`
-
-这样做的目标是让复杂任务更稳定，不容易在多轮工具调用中丢步骤，也能同时覆盖简单清单和依赖任务图两种工作流。
-
-### 子代理接口
-
-当前项目已经改成阻塞式子代理分发，更接近 Claude Code 风格。
-
-父 Agent 比子 Agent 多一个专属工具：
-
-- `task(prompt)`
-  把一个边界清晰、相对独立的子任务同步委派给 fresh context 的子代理
-
-当前实现特点：
-
-- 子代理使用 fresh context 启动，不继承父对话历史
-- 子代理只拥有基础文件 / shell 工具，不允许再创建新的子代理
-- 父 Agent 继续保留 `todo`、`read_file`、`write_file`、`edit_file` 和 `shell`
-- 父 Agent 只是比子 Agent 多一个 `task` 工具，而不是只保留 `task`
-- `task` 会阻塞等待子代理跑完，再把最终文本结果同步返回给父 Agent
-- 子代理内部的消息历史和工具轨迹会被丢弃，不会污染父上下文
-- `AgentLoop.run()` 现在返回 `AgentRunResult`，而不是裸消息
-
-这套设计适合：
-
-- 把一个相对独立的阅读、搜索、总结或验证任务单独分发出去
-- 让父 Agent 拿到子任务结论后继续当前主线推理
-
-这套设计暂时不追求：
-
-- 后台并发运行多个子代理
-- `task_id` 管理
-- 终端侧的后台任务状态面板
-
-### Skill 机制
-
-当前项目已经支持本地 skill 的“两层加载”机制。
-
-第一层是常驻索引：
-
-- 启动时扫描项目根目录下的 `skills/` 目录
-- 每个 skill 目录下放一个 `SKILL.md`
-- 运行时只把 skill 的简短索引放进 system prompt
-
-第二层是按需正文：
-
-- 父 Agent 和子 Agent 都拥有 `load_skill(name)` 工具
-- 模型只有在确实需要某个方法论时，才调用 `load_skill`
-- `load_skill` 会读取对应 `SKILL.md` 全文，并作为 tool result 回填给模型
-
-当前设计特点：
-
-- skill 更像“懒加载的提示词包”，不是普通业务工具
-- 现有 AgentLoop 不需要为 skill 单独改结构
-- 父 Agent 和子 Agent 共享同一份 skill 目录，但各自独立决定是否加载
-- 当前示例内置了 `git` 和 `test` 两个 skill
-
-最小 skill 文件格式支持：
-
-- YAML frontmatter 中的 `name` 和 `description`
-- 正文部分写具体工作步骤、约束和建议
-
-示例：
-
-```md
----
-name: git
-description: Git 工作流与提交前检查方法
----
-
-# Git Skill
-...
-```
-
-### Shell 模式化权限
-
-当前项目已经有 `shell` 工具，但后续不应该一直维持“一个全能开关”式的执行模型。
-更实用的方向是给 `shell` 做模式化权限分级，让 Agent 在不同风险等级下运行。
-
-计划中的三个权限档位：
-
-- `read_only`
-  只允许查看类命令。
-  典型命令包括：`dir`、`type`、`rg`、`git status`、`git diff`
-
-- `dev_safe`
-  允许正常开发所需的测试、构建和脚本执行，但仍然限制高风险系统操作。
-  典型命令包括：`python`、`pytest`、`npm test`、`npm run build`
-
-- `dangerous`
-  面向高风险操作，默认不开放，后续最好配合确认机制使用。
-  这类操作通常包括删除、覆盖、系统级安装、进程操作、网络下载执行等
-
-这三个档位的划分原则不是按命令名字硬分，而是按风险和副作用范围划分：
-
-- `read_only`：只读信息
-- `dev_safe`：允许项目内可控副作用
-- `dangerous`：可能带来系统级或不可逆副作用
-
-这部分当前还没有接入代码，暂时只是设计约束。
-后续如果实现，会把它下沉到 `shell` 工具的策略层，而不是散落在 prompt 或临时黑名单里。
-
-## 项目约定
-
-- 这个项目中的注释、文档字符串和 `README` 统一使用中文
-- 标识符和接口字段是否保持英文，以代码可读性和协议兼容性为准
-
-## Agent Team
-
-当前项目已经接入一层最小可用的持久 teammate 机制，用来覆盖“不是一次性 fresh-context 子代理，而是有身份、有历史、能反复协作的 Agent”。
-
-### 设计目标
-
-- 跨多轮对话存活
-- 明确的 Agent 身份和生命周期
-- Agent 之间的文件式通信通道
-
-### 为什么这样实现
-
-这次没有把 team 能力硬塞进 `AgentLoop`，而是故意拆成外层子系统：
-
-- `AgentLoop`
-  继续只负责“单个 Agent 的一次循环”
-- `TeamManager`
-  负责 teammate 的身份、元数据、持久化历史和 roster
-- `MessageBus`
-  负责 `.team/inbox/*.jsonl` 里的消息收发
-- `TeamAgentRunner`
-  负责“读取某个 teammate 的 inbox -> 跑一轮 -> 自动回发结果”
-
-这样拆的原因是：
-
-- 单 Agent 运行逻辑还能继续复用
-- 一次性 subagent 和持久 teammate 的语义不会混在一起
-- 后续要扩成真正常驻的 team host 时，不需要重写底层 loop
-
-### 持久化目录
-
-当前 team 相关状态都放在项目根目录下的 `.team/`：
-
-```text
-.team/
-  config.json
-  agents/
-    lead.json
-    alice.json
-    bob.json
-  inbox/
-    lead.jsonl
-    alice.jsonl
-    bob.jsonl
-  history/
-    lead.json
-    alice.json
-    bob.json
-  sessions/
-    lead.jsonl
-    alice.jsonl
-    bob.jsonl
-```
-
-各目录含义：
-
-- `config.json`
-  team roster 摘要，记录角色、生命周期状态和待处理消息数
-- `agents/*.json`
-  单个 teammate 的元数据
-- `inbox/*.jsonl`
-  Agent 之间的 append-only 消息通道
-- `history/*.json`
-  每个 teammate 的完整持久化对话历史
-- `sessions/*.jsonl`
-  每个 teammate 运行时追加日志，便于排查
-
-### 生命周期
-
-当前 teammate 生命周期是：
-
-```text
-spawn -> idle -> working -> idle -> ... -> shutdown
-```
-
-当前版本支持的状态：
-
-- `idle`
-- `working`
-- `shutdown`
-
-说明：
-
-- `team_spawn_agent` 创建的新 teammate 默认进入 `idle`
-- `team_run_agent` 运行时会临时切到 `working`
-- 运行结束后回到 `idle`
-- `team_shutdown_agent` 会把某个 teammate 永久标记为 `shutdown`
-
-### 通信模型
-
-当前消息总线是“每个 Agent 一个 inbox 文件”的最小实现：
-
-- 发送消息：直接 append 到目标 Agent 的 `inbox/<agent_id>.jsonl`
-- 运行 teammate：先 drain 自己的 inbox，再把这些消息注入自己的历史
-
-消息格式至少包含：
-
-- `messageId`
-- `from`
-- `to`
-- `type`
-- `content`
-- `createdAt`
-
-当前支持的消息类型：
-
-- `task`
-- `note`
-- `result`
-
-### 当前工具
-
-父 Agent 现在额外拥有这些 team 工具：
-
-- `team_spawn_agent`
-- `team_list_agents`
-- `team_get_agent`
-- `team_send_message`
-- `team_peek_inbox`
-- `team_run_agent`
-- `team_shutdown_agent`
-
-其中：
-
-- `team_spawn_agent`
-  创建一个有固定身份和持久历史的 teammate
-- `team_send_message`
-  给某个 teammate 发任务、备注或结果
-- `team_run_agent`
-  让某个 teammate drain 自己的 inbox，并沿用持久历史跑一轮
-- `team_run_agent`
-  跑完后会自动把最终结果作为 `result` 消息回发给原发送方
-
-### 当前 teammate 拥有的工具
-
-teammate 运行时不会拿到全部父工具，只拿到适合长期协作的基础能力：
-
-- `team_send_message`
-- `team_list_agents`
-- `team_get_agent`
-- `compact`
-- `load_skill`
-- `read_file`
-- `write_file`
-- `edit_file`
-- `shell`
-
-当前故意不提供给 teammate：
-
-- `team_spawn_agent`
-- `team_run_agent`
-- `team_shutdown_agent`
-- `task`
-- `task graph`
-- `background jobs`
-
-原因是先把边界收窄，避免“持久 teammate 又递归创建 teammate / 子代理 / 共享任务图”导致状态混乱。
-
-### 当前限制
-
-这版是“最小可用 team”，还不是最终形态。
-
-当前限制包括：
-
-- teammate 不是常驻线程或常驻进程
-- 只有在显式调用 `team_run_agent` 时，它才会处理自己的 inbox
-- inbox 是 read + drain 模式，没有 ack、retry 或 dead-letter queue
-- `lead` 是内建身份，主交互 Agent 发送 team 消息时默认以 `lead` 身份发送
-- 一个 teammate 同一时刻只允许一个 `working`
-- 自动回信是最小策略：本轮如果处理了别人发来的非 `result` 消息，结束时就把最终文本统一回发给发送方
-
-## Agent Team 后续改进
-
-为了避免后面忘记，这里把下一阶段最值得做的升级路线写死。
-
-### 1. 真正的持久 Agent Host
-
-当前 teammate 只是“持久状态 + 手动 run once”，还不是真正常驻 Agent。
-后面可以加：
-
-- `run_team_host(agent_id)`
-- 持续轮询 inbox
-- 自动从 `idle` 进入 `working`
-- 处理完后回到 `idle`
-
-这样 teammate 就会更像真正长期存活的 Agent。
-
-### 2. inbox 从 drain 升级为 ack
-
-当前 inbox 是：
-
-- append-only
-- run 时 read + drain
-
-这个实现简单，但缺点是：
-
-- 中途崩溃时可能丢消息
-- 不能重试
-
-后面更稳的做法是：
-
-- 先读取消息
-- 标记为 inflight
-- 成功处理后再 ack
-- 失败时可以重试或进入死信队列
-
-### 3. 引入 outbox / 事件流
-
-当前主要是 inbox 通道。
-后面可以补：
-
-- `outbox/`
-- 统一事件日志
-- 结果、告警、阻塞、完成事件分流
-
-这样更适合做 team 可视化和问题追踪。
-
-### 4. teammate 级别的任务图联动
-
-当前 `.tasks/` 是项目级任务图，team 还没和它自动联动。
-后面可以做：
-
-- teammate 完成消息后自动建议 `task_update`
-- task graph 里的 ready 节点自动分发给某个 teammate
-- teammate 完成后自动解锁下游任务
-
-### 5. team 与后台任务系统联动
-
-当前后台 job 和 team 是分开的。
-后面可以做：
-
-- teammate 启动后台 job
-- teammate 等待 job 完成消息
-- job 完成后自动投递到对应 teammate inbox
-
-这样适合长时间测试、构建和扫描任务。
-
-### 6. teammate 权限分层
-
-当前 teammate 的工具集还是静态的。
-后面可以给不同角色不同权限，例如：
-
-- researcher：偏读、偏总结
-- coder：允许写文件
-- reviewer：以只读为主
-
-再进一步，可以把 shell 的 `read_only / dev_safe / dangerous` 权限档位也接到 teammate 身上。
-
-### 7. 更好的结果路由
-
-当前 `team_run_agent` 的自动回发策略比较粗。
-后面可以升级成：
-
-- 针对不同 sender 分别总结
-- 针对不同消息类型采用不同 reply 策略
-- 支持显式 `reply_to`
-- 支持多跳协作链路
-
-### 8. 可视化 team 面板
-
-当前主要靠工具文本查看状态。
-后面可以加统一面板，集中显示：
-
-- 当前有哪些 teammate
-- 各自状态
-- inbox 消息数
-- 最近一次结果
-- 最近一次失败
-
-这样 team 会更好调试，也更接近真正可用的协作运行时。
-
-## 权限审查（S7）
-
-当前版本已经接入“意图先审查”的最小权限管道，执行顺序为：
-
-1. deny rules
-2. mode check
-3. allow rules
-4. ask user
-
-触发敏感操作时，会在终端要求用户确认。
-
-### 目前的实现
-
-- `PermissionPolicy` 负责做四步评估（见 `agent_runtime/permissions.py`）
-- `PermissionHook` 在 `before_tool_execute` 事件里调用 `PermissionPolicy`
-- 如果需要确认，会调用主程序的 `_prompt_user_approval`
-
-### 模式
-
-通过环境变量控制：
-
-```env
 PERMISSION_MODE=dev_safe
 ```
 
-可选值：
+## 运行
 
-- `read_only`：禁止写入与 shell
-- `dev_safe`：允许常规开发写入与有限 shell
-- `dangerous`：更少限制，但仍保留 deny 规则
+```powershell
+python main.py
+```
 
-### 规则说明
+## 当前阶段
 
-- deny rules：硬拒绝高危命令片段（如 `rm -rf /`、`shutdown` 等）
-- mode check：根据模式限制工具种类
-- allow rules：低风险工具直接放行，shell 命令白名单放行
-- ask user：其余操作统一弹窗确认
+这个项目已经不是最早的“单 agent + shell”原型了，当前更接近一个轻量 agent runtime，重点已经转向：
 
-### 当前限制与改进方向
+- 结构清晰
+- 状态可恢复
+- 能力分层
+- 协作可扩展
 
-这只是最小版权限系统，还需要补强：
+后面继续迭代时，优先级大概会落在：
 
-- 更精细的命令解析与平台差异处理
-- 支持“确认一次后信任一段时间”
-- 把权限档位从环境变量升级为运行时可切换
-- 与 team/subagent/background job 打通一致的权限策略
-
-## Hook 设计边界
-
-当前版本已经引入最小 hook 层，用来承接 runtime 的横切逻辑。
-
-### 当前 hook 事件
-
-- `before_llm_request`
-- `after_llm_response`
-- `before_tool_execute`
-- `after_tool_execute`
-- `before_compact`
-- `after_compact`
-
-### 当前已接入的 hook
-
-- `BackgroundJobHook`
-  在 `before_llm_request` 事件里，把已完成后台任务结果注入历史
-- `PermissionHook`
-  在 `before_tool_execute` 事件里做权限审查与用户确认
-
-### 什么应该做成 hook
-
-只把“生命周期事件上的横切逻辑”做成 hook。典型例子：
-
-- 权限审查
-- 审计与日志
-- 后台事件回注
-- 运行前后补充上下文
-- 对某个动作做 allow / deny / skip 这类策略判断
-
-这些逻辑的共同点是：
-
-- 它们依附在某个运行时事件上
-- 不拥有核心业务编排
-- 更像“观察、拦截、补充、记录”
-
-### 什么不应该做成 hook
-
-下面这些属于 runtime 内核或业务能力，不应该为了“统一”而强行 hook 化：
-
-- `AgentLoop` 的主回合推进
-- tool call 执行与 tool result 回填
-- `compact` 的核心压缩逻辑
-- `task` / `subagent` / `team` 的主业务流程
-- history 的真实持久化与状态迁移
-
-这些逻辑的共同点是：
-
-- 它们定义系统主语义
-- 必须由主循环或对应 manager/runner 直接负责
-- 如果抽成 hook，会让控制流分散、难以验证正确性
-
-### 新功能如何判断是否使用 hook
-
-默认不要先写 hook，先判断它属于哪一类：
-
-1. 模型要主动调用的能力：
-   做 `tool`
-2. 需要独立上下文和独立推理的任务：
-   做 `subagent` 或 `teammate`
-3. 需要稳定持有状态和业务流程的模块：
-   做 `manager` / `runner`
-4. 只是在某个生命周期节点观察、拦截、补充、记录：
-   才做 `hook`
-
-### Hook 的约束
-
-为了防止 hook 膨胀，当前约束是：
-
-- hook 可以返回 `continue / skip / abort`
-- hook 可以追加 `request_messages`
-- hook 可以追加 `append_messages`
-- hook 不直接执行工具
-- hook 不直接改 task graph / team 状态
-- hook 不直接接管主循环
-
-### compact 的边界
-
-`compact` 现在也有 `before_compact` / `after_compact` 事件，但这不代表把 `compact` 本身做成 hook。
-
-边界是：
-
-- `compact_history()` 仍然是 runtime 内核能力
-- hook 只允许围绕 compact 做观察、审计、补充或策略控制
-- 不允许 hook 取代 compact 的核心历史压缩与替换逻辑
+- 更完整的恢复路径
+- 更稳的 team 协议
+- 更好的记忆提取与检索
+- 更细的权限与执行控制

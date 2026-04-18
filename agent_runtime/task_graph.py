@@ -34,6 +34,8 @@ class TaskNode:
     status: TaskStatus
     blocked_by: list[int]
     owner: str
+    claimed_by: str
+    claimed_at: float | None
     created_at: float
     updated_at: float
 
@@ -47,6 +49,8 @@ class TaskNode:
             "status": self.status,
             "blockedBy": self.blocked_by,
             "owner": self.owner,
+            "claimedBy": self.claimed_by,
+            "claimedAt": self.claimed_at,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
@@ -62,6 +66,10 @@ class TaskNode:
             status=str(data.get("status", "pending")),  # type: ignore[arg-type]
             blocked_by=[int(item) for item in data.get("blockedBy", [])],  # type: ignore[arg-type]
             owner=str(data.get("owner", "")),
+            claimed_by=str(data.get("claimedBy", "")),
+            claimed_at=(
+                float(data.get("claimedAt")) if data.get("claimedAt") is not None else None
+            ),
             created_at=float(data.get("createdAt", time.time())),
             updated_at=float(data.get("updatedAt", time.time())),
         )
@@ -97,6 +105,8 @@ class TaskGraphManager:
             status="pending",
             blocked_by=blocked_by,
             owner=owner,
+            claimed_by="",
+            claimed_at=None,
             created_at=now,
             updated_at=now,
         )
@@ -158,6 +168,10 @@ class TaskGraphManager:
             except ValueError as exc:
                 return f"错误：{exc}"
             task.status = normalized_status  # type: ignore[assignment]
+            if normalized_status in {"pending", "completed"}:
+                # 退回 pending 或进入 completed 时，自动清理 claim。
+                task.claimed_by = ""
+                task.claimed_at = None
 
         task.updated_at = time.time()
 
@@ -178,6 +192,32 @@ class TaskGraphManager:
                     lines.append(f"- task {item.id}: {item.subject}")
 
         return "\n".join(lines)
+
+    def claim_next_for_agent(self, agent_id: str, agent_role: str) -> TaskNode | None:
+        """为某个持久 teammate 认领一项可执行任务。
+
+        这里刻意做成“受限拉活”：
+        - 只看 ready 任务
+        - 只看尚未被其他 Agent 认领的任务
+        - 只认领 owner 为空、或 owner 匹配 agent_id / role 的任务
+        """
+
+        for task in self._all_tasks():
+            if self._effective_status(task) != "ready":
+                continue
+            if task.claimed_by:
+                continue
+            if not self._is_claimable_by(task=task, agent_id=agent_id, agent_role=agent_role):
+                continue
+
+            task.status = "in_progress"
+            task.claimed_by = agent_id
+            task.claimed_at = time.time()
+            task.updated_at = time.time()
+            self._save(task)
+            return task
+
+        return None
 
     def get(self, task_id: int) -> str:
         """查看单个任务。"""
@@ -385,6 +425,15 @@ class TaskGraphManager:
         if task.status == "pending":
             return "blocked" if self._unmet_dependency_ids(task) else "ready"
         return task.status
+
+    @staticmethod
+    def _is_claimable_by(task: TaskNode, agent_id: str, agent_role: str) -> bool:
+        """判断某个 teammate 是否允许认领该任务。"""
+
+        owner = task.owner.strip()
+        if not owner:
+            return True
+        return owner in {agent_id, agent_role}
 
     def _unmet_dependencies(self, task: TaskNode) -> str:
         """返回未完成依赖的文本摘要。"""

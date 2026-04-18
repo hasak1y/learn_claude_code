@@ -32,6 +32,7 @@ from .agent import AgentLoop
 from .compaction import ConversationCompactor
 from .llm.base import BaseLLMClient
 from .session_log import SessionLogger
+from .task_graph import TaskGraphManager, TaskNode
 from .tools.base import ToolRegistry
 from .types import AgentRunResult, ConversationMessage, ToolCall
 
@@ -65,6 +66,7 @@ class TeamAgentRecord:
     role: str
     description: str
     system_prompt: str
+    auto_pull_tasks: bool
     status: TeamAgentStatus
     created_at: float
     updated_at: float
@@ -77,6 +79,7 @@ class TeamAgentRecord:
             "role": self.role,
             "description": self.description,
             "systemPrompt": self.system_prompt,
+            "autoPullTasks": self.auto_pull_tasks,
             "status": self.status,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
@@ -91,6 +94,7 @@ class TeamAgentRecord:
             role=str(data.get("role", "")),
             description=str(data.get("description", "")),
             system_prompt=str(data.get("systemPrompt", "")),
+            auto_pull_tasks=bool(data.get("autoPullTasks", False)),
             status=str(data.get("status", "idle")),  # type: ignore[arg-type]
             created_at=float(data.get("createdAt", time.time())),
             updated_at=float(data.get("updatedAt", time.time())),
@@ -402,6 +406,7 @@ class TeamManager:
         role: str,
         description: str = "",
         system_prompt: str = "",
+        auto_pull_tasks: bool = False,
     ) -> str:
         """创建一个新的持久 teammate。"""
 
@@ -421,6 +426,7 @@ class TeamManager:
             role=clean_role,
             description=description,
             system_prompt=system_prompt,
+            auto_pull_tasks=auto_pull_tasks,
             status="idle",
             created_at=now,
             updated_at=now,
@@ -443,6 +449,7 @@ class TeamManager:
             pending_requests = self._count_pending_requests(agent.agent_id)
             lines.append(
                 f"- {agent.agent_id} | role={agent.role} | status={agent.status} "
+                f"| auto_pull_tasks={agent.auto_pull_tasks} "
                 f"| pending_messages={pending} | pending_requests={pending_requests}"
             )
         return "\n".join(lines)
@@ -753,10 +760,12 @@ class TeamManager:
             f"你的 agent_id 是：{agent.agent_id}\n"
             f"你的角色是：{agent.role}\n"
             f"你的职责描述：{agent.description or '（未填写）'}\n"
+            f"自动拉取任务：{'开启' if agent.auto_pull_tasks else '关闭'}\n"
             "你会保留自己的历史和身份，来自 inbox 的 team 消息会被追加进你的上下文。\n"
             "如果需要把结论、阻塞或请求发给其他 Agent，请使用 team_send_message。\n"
             "如果需要发起审批、关机、交接或签收这类结构化请求，请使用 team_send_protocol。\n"
             "如果你收到 protocol request 并需要更新状态，请使用 team_respond_protocol。\n"
+            "你可以使用 task_get / task_update / task_list_ready / task_list_all 查看或更新任务图，但不要创建新任务。\n"
             "不要尝试创建、关闭或直接运行其他 teammate，除非外层显式提供了那类工具。\n"
         )
         if agent.system_prompt.strip():
@@ -785,6 +794,7 @@ class TeamManager:
             role="lead",
             description="主交互 Agent，用来创建 teammate、分发消息和读取结果。",
             system_prompt="",
+            auto_pull_tasks=False,
             status="idle",
             created_at=now,
             updated_at=now,
@@ -812,6 +822,7 @@ class TeamManager:
                     "role": agent.role,
                     "description": agent.description,
                     "status": agent.status,
+                    "autoPullTasks": agent.auto_pull_tasks,
                     "pendingMessages": self.bus.count_pending(agent.agent_id),
                     "pendingRequests": self._count_pending_requests(agent.agent_id),
                     "updatedAt": agent.updated_at,
@@ -988,8 +999,10 @@ class TeamAgentRunner:
     llm_client_factory: Callable[[], BaseLLMClient]
     tool_registry_factory: Callable[[str], ToolRegistry]
     base_system_prompt_builder: Callable[[str], str]
+    task_graph_manager: TaskGraphManager | None = None
     startup_messages: list[ConversationMessage] | None = None
     max_steps: int = 8
+    max_auto_claims_per_run: int = 1
     compactor: ConversationCompactor | None = None
 
     def run_once(self, agent_id: str) -> str:
@@ -1005,11 +1018,6 @@ class TeamAgentRunner:
         if agent.status == "working":
             return f"错误：Agent '{agent_id}' 当前正在 working"
 
-        inbox_items = self.team_manager.drain_inbox(agent_id)
-        self.team_manager._write_config()
-        if not inbox_items:
-            return f"Agent '{agent_id}' 的 inbox 为空，无需运行。"
-
         history = self.team_manager.load_history(agent_id)
         # 清理历史里的孤立 tool 消息，避免服务端报
         # "No tool call found for function call output"。
@@ -1023,6 +1031,161 @@ class TeamAgentRunner:
             session_logger=session_logger,
             scope=f"team:{agent_id}:startup",
         )
+
+        self.team_manager.set_status(agent_id, "working")
+        processed_inbox_items = 0
+        auto_claim_count = 0
+        reply_senders: set[str] = set()
+        last_run_result: AgentRunResult | None = None
+        try:
+            system_prompt = self.team_manager.build_agent_system_prompt(
+                agent_id=agent_id,
+                base_prompt=self.base_system_prompt_builder(agent_id),
+            )
+            while True:
+                inbox_items = self.team_manager.drain_inbox(agent_id)
+                if inbox_items:
+                    processed_inbox_items += len(inbox_items)
+                    self.team_manager._write_config()
+                    for item in inbox_items:
+                        if (
+                            item.kind == "protocol"
+                            and item.protocol is not None
+                            and item.protocol.envelope_type == "request"
+                        ):
+                            self.team_manager.acknowledge_request(
+                                agent_id=agent_id,
+                                request_id=item.protocol.request_id,
+                            )
+                    message_items = self._inject_inbox_items(
+                        history=history,
+                        session_logger=session_logger,
+                        agent_id=agent_id,
+                        inbox_items=inbox_items,
+                    )
+                    reply_senders.update(
+                        message.sender
+                        for message in message_items
+                        if message.sender != agent_id and message.message_type != "result"
+                    )
+                else:
+                    auto_task = self._claim_next_task(agent)
+                    if auto_task is None:
+                        if last_run_result is None:
+                            return f"Agent '{agent_id}' 的 inbox 为空，且当前没有可自动认领的任务。"
+                        break
+
+                    auto_claim_count += 1
+                    auto_message = ConversationMessage(
+                        role="user",
+                        content=self._build_auto_claim_message(task=auto_task, agent=agent),
+                    )
+                    history.append(auto_message)
+                    session_logger.append_message(auto_message, scope=f"team:{agent_id}:auto_claim")
+
+                last_run_result = AgentLoop(
+                    llm_client=self.llm_client_factory(),
+                    tool_registry=self.tool_registry_factory(agent_id),
+                    system_prompt=system_prompt,
+                    max_steps=self.max_steps,
+                    echo_tool_calls=False,
+                    compactor=self.compactor,
+                    session_logger=session_logger,
+                    log_scope=f"team:{agent_id}",
+                ).run(history)
+
+                if (
+                    not agent.auto_pull_tasks
+                    or auto_claim_count >= self.max_auto_claims_per_run
+                    or last_run_result.status != "completed"
+                ):
+                    break
+        except RuntimeError as exc:
+            last_run_result = AgentRunResult(
+                status="failed",
+                final_text=f"teammate '{agent_id}' 运行失败：{exc}",
+                steps=0,
+                last_message=None,
+                error=str(exc),
+            )
+        finally:
+            # 无论本轮执行成功还是失败，都把最新历史和生命周期状态落回磁盘，
+            # 避免 teammate 因中途异常而永久卡在 working。
+            self.team_manager.save_history(agent_id, history)
+            self.team_manager.set_status(agent_id, "idle")
+
+        run_result = last_run_result or AgentRunResult(
+            status="completed",
+            final_text="未执行任何任务。",
+            steps=0,
+            last_message=None,
+        )
+        for sender in sorted(reply_senders):
+            self.team_manager.send_message(
+                sender=agent_id,
+                recipient=sender,
+                message_type="result",
+                content=run_result.final_text,
+            )
+
+        if reply_senders:
+            recipients = ", ".join(sorted(reply_senders))
+            return (
+                f"已运行 teammate '{agent_id}'，处理 inbox 项 {processed_inbox_items} 条，"
+                f"自动认领任务 {auto_claim_count} 项。\n"
+                f"运行状态：{run_result.status}\n"
+                f"已自动把结果回发给：{recipients}\n"
+                f"结果摘要：\n{run_result.final_text}"
+            )
+
+        return (
+            f"已运行 teammate '{agent_id}'，处理 inbox 项 {processed_inbox_items} 条，"
+            f"自动认领任务 {auto_claim_count} 项。\n"
+            f"运行状态：{run_result.status}\n"
+            f"结果摘要：\n{run_result.final_text}"
+        )
+
+    def _claim_next_task(self, agent: TeamAgentRecord) -> TaskNode | None:
+        """在允许自治时，为 teammate 认领下一项匹配自己角色的 ready 任务。"""
+
+        if not agent.auto_pull_tasks:
+            return None
+        if self.task_graph_manager is None:
+            return None
+        if self.team_manager._count_pending_requests(agent.agent_id) > 0:
+            # 有待处理协议请求时，优先让 agent 处理显式控制流，而不是继续领活。
+            return None
+
+        return self.task_graph_manager.claim_next_for_agent(
+            agent_id=agent.agent_id,
+            agent_role=agent.role,
+        )
+
+    @staticmethod
+    def _build_auto_claim_message(task: TaskNode, agent: TeamAgentRecord) -> str:
+        """把自动认领的任务包装成注入上下文的内部消息。"""
+
+        return (
+            "<auto_claimed_task>\n"
+            f"task_id: {task.id}\n"
+            f"subject: {task.subject}\n"
+            f"owner_hint: {task.owner or '（无）'}\n"
+            f"claimed_by: {task.claimed_by}\n"
+            f"description:\n{task.description or '（无）'}\n\n"
+            "这是你在空闲状态下自动认领的一项 ready 任务。"
+            "你可以使用 task_get 查看完整任务信息，并在完成后使用 task_update 把它更新为 completed。"
+            "</auto_claimed_task>"
+        )
+
+    @staticmethod
+    def _inject_inbox_items(
+        *,
+        history: list[ConversationMessage],
+        session_logger: SessionLogger,
+        agent_id: str,
+        inbox_items: list[TeamInboxItem],
+    ) -> list[TeamMessage]:
+        """把 inbox 项统一注入到 teammate 历史中。"""
 
         message_items: list[TeamMessage] = []
         for inbound in inbox_items:
@@ -1043,11 +1206,8 @@ class TeamAgentRunner:
                 continue
 
             if inbound.kind == "protocol" and inbound.protocol is not None:
+                # 这里不做额外逻辑，协议状态已在外层 runner 中先更新。
                 if inbound.protocol.envelope_type == "request":
-                    self.team_manager.acknowledge_request(
-                        agent_id=agent_id,
-                        request_id=inbound.protocol.request_id,
-                    )
                     protocol_message = ConversationMessage(
                         role="user",
                         content=(
@@ -1078,63 +1238,7 @@ class TeamAgentRunner:
                 history.append(protocol_message)
                 session_logger.append_message(protocol_message, scope=f"team:{agent_id}:inbox")
 
-        self.team_manager.set_status(agent_id, "working")
-        try:
-            system_prompt = self.team_manager.build_agent_system_prompt(
-                agent_id=agent_id,
-                base_prompt=self.base_system_prompt_builder(agent_id),
-            )
-            run_result = AgentLoop(
-                llm_client=self.llm_client_factory(),
-                tool_registry=self.tool_registry_factory(agent_id),
-                system_prompt=system_prompt,
-                max_steps=self.max_steps,
-                echo_tool_calls=False,
-                compactor=self.compactor,
-                session_logger=session_logger,
-                log_scope=f"team:{agent_id}",
-            ).run(history)
-        except RuntimeError as exc:
-            run_result = AgentRunResult(
-                status="failed",
-                final_text=f"teammate '{agent_id}' 运行失败：{exc}",
-                steps=0,
-                last_message=None,
-                error=str(exc),
-            )
-        finally:
-            # 无论本轮执行成功还是失败，都把最新历史和生命周期状态落回磁盘，
-            # 避免 teammate 因中途异常而永久卡在 working。
-            self.team_manager.save_history(agent_id, history)
-            self.team_manager.set_status(agent_id, "idle")
-
-        reply_senders = {
-            message.sender
-            for message in message_items
-            if message.sender != agent_id and message.message_type != "result"
-        }
-        for sender in sorted(reply_senders):
-            self.team_manager.send_message(
-                sender=agent_id,
-                recipient=sender,
-                message_type="result",
-                content=run_result.final_text,
-            )
-
-        if reply_senders:
-            recipients = ", ".join(sorted(reply_senders))
-            return (
-                f"已运行 teammate '{agent_id}'，处理 inbox 项 {len(inbox_items)} 条。\n"
-                f"运行状态：{run_result.status}\n"
-                f"已自动把结果回发给：{recipients}\n"
-                f"结果摘要：\n{run_result.final_text}"
-            )
-
-        return (
-            f"已运行 teammate '{agent_id}'，处理 inbox 项 {len(inbox_items)} 条。\n"
-            f"运行状态：{run_result.status}\n"
-            f"结果摘要：\n{run_result.final_text}"
-        )
+        return message_items
 
     @staticmethod
     def _ensure_startup_messages(

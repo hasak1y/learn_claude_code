@@ -35,6 +35,10 @@ class SpawnTeamAgentTool(BaseTool):
                 "type": "string",
                 "description": "这个 teammate 的额外个人说明或长期工作约束，可选。",
             },
+            "auto_pull_tasks": {
+                "type": "boolean",
+                "description": "是否允许该 teammate 在空闲且 inbox 为空时，自动从任务图中认领下一项匹配自己角色的 ready 任务。",
+            },
         },
         "required": ["agent_id", "role"],
     }
@@ -48,6 +52,7 @@ class SpawnTeamAgentTool(BaseTool):
             role=str(arguments.get("role", "")).strip(),
             description=str(arguments.get("description", "")),
             system_prompt=str(arguments.get("system_prompt", "")),
+            auto_pull_tasks=bool(arguments.get("auto_pull_tasks", False)),
         )
 
 
