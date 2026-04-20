@@ -457,6 +457,18 @@ class TeamManager:
             )
         return "\n".join(lines)
 
+    def snapshot_agents(self) -> list[dict[str, object]]:
+        """返回适合 UI / API 直接消费的 teammate 快照。"""
+
+        agents = self._all_agents()
+        payload: list[dict[str, object]] = []
+        for agent in agents:
+            item = agent.to_dict()
+            item["pendingMessages"] = self.bus.count_pending(agent.agent_id)
+            item["pendingRequests"] = self._count_pending_requests(agent.agent_id)
+            payload.append(item)
+        return payload
+
     def get_agent(self, agent_id: str) -> str:
         """查看单个 Agent 的元数据。"""
 
@@ -713,6 +725,18 @@ class TeamManager:
                 f"from={record.requester} | to={record.recipient} | status={record.status}"
             )
         return "\n".join(lines)
+
+    def snapshot_requests(self, agent_id: str | None = None) -> list[dict[str, object]]:
+        """返回结构化 protocol request 快照。"""
+
+        requests = self._all_requests()
+        if agent_id is not None:
+            requests = [
+                item
+                for item in requests
+                if item.requester == agent_id or item.recipient == agent_id
+            ]
+        return [record.to_dict() for record in requests]
 
     def list_inbox(self, agent_id: str) -> str:
         """查看某个 Agent 当前 inbox 中的待处理消息。"""

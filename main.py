@@ -11,10 +11,10 @@ from pathlib import Path
 from agent_runtime.agent import AgentLoop
 from agent_runtime.background_jobs import BackgroundJobManager
 from agent_runtime.compaction import ConversationCompactor
-from agent_runtime.config import load_openai_compatible_config
+from agent_runtime.config import load_openai_compatible_configs
 from agent_runtime.dialogue_history import RecentDialogueStore
 from agent_runtime.hooks import HookManager
-from agent_runtime.llm import OpenAICompatibleLLMClient
+from agent_runtime.llm import FallbackLLMClient, OpenAICompatibleLLMClient
 from agent_runtime.memory import AutoMemoryManager, LearnClaudeContextLoader
 from agent_runtime.mcp_client import MCPClient, load_mcp_server_configs
 from agent_runtime.runtime_hooks import (
@@ -437,11 +437,20 @@ def build_parent_tool_registry(
     )
 
 
+def _build_llm_client(endpoint_configs: list) -> OpenAICompatibleLLMClient | FallbackLLMClient:
+    """根据 endpoint 数量构造单一 client 或 failover client。"""
+
+    clients = [OpenAICompatibleLLMClient(config) for config in endpoint_configs]
+    if len(clients) == 1:
+        return clients[0]
+    return FallbackLLMClient(clients)
+
+
 def main() -> None:
     """启动一个交互式命令行会话。"""
 
     try:
-        config = load_openai_compatible_config()
+        endpoint_configs = load_openai_compatible_configs()
     except KeyError as exc:
         missing_key = exc.args[0]
         print(f"缺少必填环境变量：{missing_key}")
@@ -452,11 +461,12 @@ def main() -> None:
         )
         return
 
+    config = endpoint_configs[0]
     cwd = Path(os.getcwd())
     managed_rules_path_raw = os.getenv("LEARNCLAUDE_MANAGED_PATH", "").strip()
     managed_rules_path = Path(managed_rules_path_raw) if managed_rules_path_raw else None
 
-    llm_client = OpenAICompatibleLLMClient(config)
+    llm_client = _build_llm_client(endpoint_configs)
     # 默认提升到 dangerous，本地桌面端主要是可信开发环境；
     # 真要收紧时仍然可以通过环境变量显式切回 dev_safe / read_only。
     permission_mode = os.getenv("PERMISSION_MODE", "dangerous")
@@ -513,7 +523,7 @@ def main() -> None:
     )
 
     subagent_runner = SubagentRunner(
-        llm_client_factory=lambda: OpenAICompatibleLLMClient(config),
+        llm_client_factory=lambda: _build_llm_client(endpoint_configs),
         child_tool_registry_factory=lambda: build_child_tool_registry(
             skill_registry,
             mcp_client=mcp_client,
@@ -530,7 +540,7 @@ def main() -> None:
 
     team_runner = TeamAgentRunner(
         team_manager=team_manager,
-        llm_client_factory=lambda: OpenAICompatibleLLMClient(config),
+        llm_client_factory=lambda: _build_llm_client(endpoint_configs),
         tool_registry_factory=lambda agent_id, workspace_cwd=None: build_team_agent_tool_registry(
             skill_registry=skill_registry,
             team_manager=team_manager,
@@ -616,6 +626,8 @@ def main() -> None:
         )
     if learnclaude_text:
         print("[learnclaude] 已加载长期规则层。")
+    if len(endpoint_configs) > 1:
+        print(f"[llm] 已加载 {len(endpoint_configs)} 个 LLM endpoint，当前启用自动 failover。")
     if mcp_client is not None:
         print(f"[mcp] 已加载 {len(mcp_server_configs)} 个 MCP server。")
     print(

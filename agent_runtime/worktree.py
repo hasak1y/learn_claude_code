@@ -181,6 +181,14 @@ class WorktreeManager:
             )
         return "\n".join(lines)
 
+    def snapshot_records(self, status: str | None = None) -> list[dict[str, object]]:
+        """返回适合 UI / API 直接消费的 worktree 快照。"""
+
+        records = self._all_records()
+        if status is not None:
+            records = [record for record in records if record.status == status]
+        return [record.to_dict() for record in records]
+
     def get_record_text(self, task_id: int) -> str:
         """格式化查看单条 worktree 记录。"""
 

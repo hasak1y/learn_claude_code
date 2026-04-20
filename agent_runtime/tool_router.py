@@ -8,6 +8,7 @@ router 只做一件事：
 from __future__ import annotations
 
 from dataclasses import dataclass
+import copy
 from typing import Any, Literal, Protocol
 
 from .mcp_client import MCPClient
@@ -43,6 +44,7 @@ class ToolSpec:
         return self.display_name or self.name
 
     def to_openai_tool_schema(self) -> dict[str, Any]:
+        parameters = self._normalize_input_schema(self.input_schema)
         description = self.description
         if self.display_name and self.display_name != self.name:
             description = f"{description}\n逻辑名: {self.display_name}".strip()
@@ -51,9 +53,35 @@ class ToolSpec:
             "function": {
                 "name": self.name,
                 "description": description,
-                "parameters": self.input_schema,
+                "parameters": parameters,
             },
         }
+
+    @staticmethod
+    def _normalize_input_schema(schema: dict[str, Any]) -> dict[str, Any]:
+        """把工具 schema 收敛成更稳的 OpenAI-compatible 形式。
+
+        某些网关要求：
+        - 顶层必须是 object
+        - `properties` 必须存在
+        - `required` 必须是数组，不能缺失也不能是 null
+        """
+
+        normalized = copy.deepcopy(schema) if isinstance(schema, dict) else {}
+        if normalized.get("type") != "object":
+            normalized["type"] = "object"
+
+        properties = normalized.get("properties")
+        if not isinstance(properties, dict):
+            normalized["properties"] = {}
+
+        required = normalized.get("required")
+        if required is None:
+            normalized["required"] = []
+        elif not isinstance(required, list):
+            normalized["required"] = []
+
+        return normalized
 
 
 class ToolRouter:

@@ -529,6 +529,24 @@ class TaskGraphManager:
             f"abandoned: {', '.join(abandoned) if abandoned else '（无）'}"
         )
 
+    def snapshot(self) -> dict[str, list[dict[str, object]]]:
+        """返回适合 UI / API 直接消费的结构化任务快照。"""
+
+        tasks = self._all_tasks()
+        groups = {
+            "ready": [task for task in tasks if self._effective_status(task) == "ready"],
+            "blocked": [task for task in tasks if self._effective_status(task) == "blocked"],
+            "in_progress": [task for task in tasks if task.status == "in_progress"],
+            "integration_pending": [task for task in tasks if task.status == "integration_pending"],
+            "completed": [task for task in tasks if task.status == "completed"],
+            "cancelled": [task for task in tasks if task.status == "cancelled"],
+            "abandoned": [task for task in tasks if task.status == "abandoned"],
+        }
+        return {
+            group_name: [task.to_dict() for task in group_tasks]
+            for group_name, group_tasks in groups.items()
+        }
+
     def has_tasks(self) -> bool:
         """判断当前是否已有任务图任务。"""
 
